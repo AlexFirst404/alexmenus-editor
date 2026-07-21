@@ -16,6 +16,11 @@
 
   // ------------------------------------------------------------------ constants
   const ICON_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/textures/';
+  const MODEL_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/models/';
+  // face-texture priority lists for resolving a cube's top/side from a model's textures map
+  const TOP_KEYS = ['up', 'top', 'end', 'all', 'side', 'north', 'texture', 'particle', 'wall', 'cross'];
+  const SIDE_KEYS = ['side', 'north', 'west', 'south', 'east', 'all', 'texture', 'particle', 'wall', 'up', 'top'];
+  const modelCache = new Map();   // model path -> Promise<json|null>  (dedupes CDN fetches)
   const BUNDLE_VERSION = 1;
 
   // Default paste-service Worker, used when the link is the clean `#<code>` form (no w=).
@@ -273,7 +278,9 @@
 
     const count = type === 'inventory' ? 27 : rowsOf(m.obj) * 9;
     const items = m.obj.items || {};
+    resetIconObserver(); // new lazy-icon observer for this grid generation
     for (let s = 0; s < count; s++) grid.append(buildCell(items[String(s)], s));
+    scheduleIconFallback(grid);
     updateSelCounter();
   }
 
@@ -283,7 +290,7 @@
     cell.append(el('span', 'cell-num', String(slot)));
     if (item) {
       cell.classList.add('filled');
-      cell.append(buildIcon(item.material, 'cell-ic', 'cell-txt'));
+      cell.append(makeIconHolder(item.material, 40, 'cell-txt', true));
     }
     if (state.selected.has(slot)) cell.classList.add('selected');
     if (state.active === slot) cell.classList.add('active');
@@ -671,32 +678,161 @@
   }
   function propagateClicksIfBulk() { if (targetSlots().length > 1) propagateClicks(); }
 
-  // ================================================================== ICONS (best-effort)
-  // Try textures/item/<name>.png, then block/<name>.png; on failure show short material text.
-  function buildIcon(material, imgCls, txtCls) {
-    const name = String(material || '').toLowerCase().replace(/^minecraft:/, '').replace(/\s+/g, '').trim();
-    if (!name) return el('span', txtCls, '?');
-    const urls = [ICON_BASE + 'item/' + name + '.png', ICON_BASE + 'block/' + name + '.png'];
-    const img = document.createElement('img');
-    img.className = imgCls;
-    img.loading = 'lazy';
-    img.alt = '';
-    let stage = 0;
-    img.onerror = () => {
-      stage += 1;
-      if (stage < urls.length) { img.src = urls[stage]; return; }
-      const span = el('span', txtCls, shortMat(name));
-      if (img.parentNode) img.parentNode.replaceChild(span, img);
-    };
-    img.src = urls[0];
-    return img;
+  // ================================================================== ICONS (model-JSON aware)
+  // In MC 1.21.11 models/item/<block>.json 404s for block-items, so a naive item/block texture
+  // probe misses most blocks. Instead we resolve via the model JSON: redirect item -> block model,
+  // walk the parent chain accumulating textures, and classify flat (layer0) / cube / cross / blank.
+  // CDN CORS is `*`, so fetch() of the model JSON works. Results are cached per material.
+
+  const stripNs = (s) => String(s == null ? '' : s).replace(/^minecraft:/, '');
+  const texUrl = (p) => ICON_BASE + stripNs(p) + '.png';
+
+  function fetchModelJson(path) {
+    if (modelCache.has(path)) return modelCache.get(path);
+    const p = fetch(MODEL_BASE + path + '.json').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    modelCache.set(path, p);
+    return p;
   }
+  // follow #ref indirection inside a textures map to a concrete texture path (or null)
+  function resolveRef(val, tex) {
+    let v = stripNs(val), d = 0;
+    while (v && v[0] === '#' && d < 12) { v = stripNs(tex[v.slice(1)]); d++; }
+    return (v && v[0] !== '#') ? v : null;
+  }
+  function pickFace(keys, tex) {
+    for (const k of keys) if (k in tex) { const r = resolveRef(tex[k], tex); if (r) return r; }
+    return null;
+  }
+  function finishCube(tex) {
+    const top = pickFace(TOP_KEYS, tex), side = pickFace(SIDE_KEYS, tex);
+    if (!top && !side) return { kind: 'blank' };
+    const front = ('front' in tex) ? resolveRef(tex.front, tex) : null;
+    return { kind: 'cube', top: top || side, side: side || top, front };
+  }
+  // classify a material -> {kind:'flat',tex} | {kind:'cube',top,side,front} | {kind:'blank'}
+  async function resolveIconModel(name) {
+    let model = await fetchModelJson('item/' + name);
+    if (!model) {
+      model = (await fetchModelJson('block/' + name)) || (await fetchModelJson('block/' + name + '_inventory'));
+      if (!model) return { kind: 'blank' };
+    }
+    const tex = {};
+    for (let hops = 0; model && hops < 14; hops++) {
+      if (model.textures) for (const k in model.textures) if (!(k in tex)) tex[k] = model.textures[k];
+      if (tex.layer0) { const t = resolveRef(tex.layer0, tex); return t ? { kind: 'flat', tex: t } : { kind: 'blank' }; }
+      const parent = stripNs(model.parent || '');
+      if (parent.startsWith('builtin/') || parent.startsWith('item/template_')) return { kind: 'blank' };
+      if (parent === 'block/cross' || parent === 'block/tinted_cross') {
+        const t = pickFace(['cross', 'plant', 'rail', 'texture'], tex);
+        return t ? { kind: 'flat', tex: t } : finishCube(tex);
+      }
+      if (parent === 'item/generated' || parent === 'item/handheld') return finishCube(tex);
+      if (parent === '' || parent.startsWith('block/cube') || parent.startsWith('block/template_') || parent.endsWith('_inventory')
+        || parent.startsWith('block/orientable') || parent.startsWith('block/stairs') || parent.startsWith('block/slab')
+        || parent === 'block/block' || parent === 'block/leaves') return finishCube(tex);
+      model = await fetchModelJson(parent);
+    }
+    return finishCube(tex);
+  }
+
+  // build a 3D CSS cube: top face, left = side, right = front (or side)
+  function buildCube(top, side, front) {
+    const cube = el('div', 'cube');
+    const mk = (cls, p) => {
+      const d = el('div', 'face ' + cls);
+      if (p) d.style.backgroundImage = "url('" + texUrl(p) + "')";
+      cube.appendChild(d);
+    };
+    mk('top', top); mk('left', side); mk('right', front || side);
+    return cube;
+  }
+
   function shortMat(name) { return String(name || '?').split(':').pop().slice(0, 12); }
 
+  // resolved-icon cache (name -> {kind,...}) so grid rebuilds are synchronous & flicker-free
+  const iconResultCache = new Map();
+  let iconObserver = null;
+
+  // fresh observer per grid render; disconnecting the old one releases detached cell holders
+  function resetIconObserver() {
+    if (iconObserver) iconObserver.disconnect();
+    if ('IntersectionObserver' in window) {
+      iconObserver = new IntersectionObserver((entries) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) { iconObserver.unobserve(e.target); loadIcon(e.target); }
+        });
+      }, { rootMargin: '300px' });
+    } else {
+      iconObserver = null;
+    }
+  }
+
+  // Safety net for environments where IntersectionObserver never fires (e.g. a background/hidden
+  // tab): if nothing has loaded shortly after a grid build, eager-load. In a normal visible tab IO
+  // fires within a frame, so in-view holders already have content and this is a no-op (stays lazy).
+  function scheduleIconFallback(grid) {
+    setTimeout(() => {
+      const holders = grid.querySelectorAll('.ic-holder');
+      if (!holders.length) return;
+      let anyLoaded = false;
+      holders.forEach((h) => { if (h.childElementCount > 0) anyLoaded = true; });
+      if (!anyLoaded) holders.forEach((h) => { if (h.childElementCount === 0) loadIcon(h); });
+    }, 700);
+  }
+
+  // a placeholder .ic-holder that resolves its icon lazily (grid) or immediately (mat-ic preview)
+  function makeIconHolder(material, sizePx, txtCls, lazy) {
+    const holder = el('div', 'ic-holder');
+    holder.style.setProperty('--sz', sizePx + 'px');
+    holder.dataset.name = stripNs(String(material || '').toLowerCase()).replace(/\s+/g, '').trim();
+    holder.dataset.txt = txtCls || 'cell-txt';
+    if (lazy && iconObserver) iconObserver.observe(holder);
+    else loadIcon(holder);
+    return holder;
+  }
+
+  function loadIcon(holder) {
+    const name = holder.dataset.name;
+    const txtCls = holder.dataset.txt;
+    if (!name) { holder.append(el('span', txtCls, '?')); return; }
+    if (iconResultCache.has(name)) { renderResolved(holder, iconResultCache.get(name), name, txtCls); return; }
+
+    // fast-path (no fetch): most real items have a flat item/<name>.png texture
+    const img = document.createElement('img');
+    img.className = 'flat'; img.loading = 'lazy'; img.alt = '';
+    img.onload = () => { iconResultCache.set(name, { kind: 'flat', tex: 'item/' + name }); };
+    img.onerror = () => {
+      img.remove();
+      resolveIconModel(name).then((res) => {
+        iconResultCache.set(name, res);
+        if (holder.isConnected) { clear(holder); renderResolved(holder, res, name, txtCls); }
+      });
+    };
+    img.src = ICON_BASE + 'item/' + name + '.png';
+    holder.append(img);
+  }
+
+  function renderResolved(holder, res, name, txtCls) {
+    clear(holder);
+    if (res.kind === 'flat') {
+      const im = document.createElement('img');
+      im.className = 'flat'; im.loading = 'lazy'; im.alt = '';
+      im.onerror = () => { im.remove(); if (!holder.firstChild) holder.append(el('span', txtCls, shortMat(name))); };
+      im.src = texUrl(res.tex);
+      holder.append(im);
+    } else if (res.kind === 'cube') {
+      holder.append(buildCube(res.top, res.side, res.front));
+    } else {
+      // blank: only truly-unresolvable entity items (chest/bed/head/banner/shield/conduit)
+      holder.append(el('span', txtCls, shortMat(name)));
+    }
+  }
+
+  // props material preview (small): same resolver, rendered immediately
   function setMatIcon(material) {
     const holder = $('mat-ic');
     clear(holder);
-    if (material && String(material).trim()) holder.append(buildIcon(material, null, 'mi-txt'));
+    if (material && String(material).trim()) holder.append(makeIconHolder(material, 28, 'mi-txt', false));
   }
 
   // ================================================================== RAW-YAML MODE

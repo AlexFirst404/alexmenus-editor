@@ -200,11 +200,31 @@ code { font-family:var(--mono); }
   position:absolute; top:2px; left:4px; font-size:9px;
   color:var(--faint); font-family:var(--mono); pointer-events:none;
 }
-.cell .cell-ic { width:34px; height:34px; image-rendering:pixelated; object-fit:contain; }
 .cell .cell-txt {
   font-size:9px; color:var(--muted); text-align:center; padding:0 2px;
   word-break:break-word; line-height:1.1;
 }
+
+/* ---- item icons: flat <img> or a 3D CSS cube for blocks (texture-only, theme-agnostic) ---- */
+.ic-holder {
+  width:var(--sz); height:var(--sz);
+  display:flex; align-items:center; justify-content:center;
+  perspective:260px;
+}
+.ic-holder img.flat { width:86%; height:86%; image-rendering:pixelated; object-fit:contain; }
+.ic-holder .cube {
+  --s:calc(var(--sz) * .56);
+  position:relative; width:var(--s); height:var(--s);
+  transform-style:preserve-3d; transform:rotateX(-26deg) rotateY(45deg);
+}
+.ic-holder .cube .face {
+  position:absolute; top:0; left:0; width:var(--s); height:var(--s);
+  background-size:100% 100%; image-rendering:pixelated; backface-visibility:hidden;
+}
+.ic-holder .cube .top   { transform:rotateX(90deg)  translateZ(calc(var(--s) / 2)); filter:brightness(1.05); }
+.ic-holder .cube .left  { transform:rotateY(-90deg) translateZ(calc(var(--s) / 2)); filter:brightness(.62); }
+.ic-holder .cube .right { transform:translateZ(calc(var(--s) / 2)); filter:brightness(.82); }
+
 .grid-hint { color:var(--faint); font-size:12px; margin:16px 0 0; }
 
 /* selection counter in the center toolbar */
