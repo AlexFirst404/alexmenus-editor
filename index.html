@@ -10,7 +10,7 @@
   <!--
     AlexMenus web editor (LuckPerms-style paste flow).
     Data flow:
-      1. Link opened as  #k=<code>&w=<worker-url-encoded>
+      1. Link opened as  #<code>  (clean)  OR  #k=<code>&w=<worker-url-encoded>  (legacy)
       2. GET  <w>/<k>   -> bundle { v:1, menus:[{id, yaml}] }
       3. jsyaml.load each menu's yaml -> plain JS object (edited in the UI)
       4. "Сохранить": jsyaml.dump each object, POST bundle to <w>/post -> { key }
@@ -60,6 +60,7 @@
           <span class="lbl">Рядов</span>
           <input type="number" id="menu-rows" class="in" min="1" max="6" step="1" />
         </label>
+        <div class="sel-count" id="sel-count" hidden></div>
       </div>
 
       <div class="grid-wrap" id="grid-wrap">
@@ -83,6 +84,7 @@
       </div>
 
       <div class="props-body" id="slot-editor" hidden>
+        <div class="bulk-banner" id="bulk-banner" hidden></div>
         <div class="props-head">
           <span class="props-title">Слот <b id="slot-num">0</b></span>
           <button class="btn small danger-ghost" id="clear-slot-btn" type="button">Очистить слот</button>
@@ -198,6 +200,9 @@
       </div>
     </div>
   </div>
+
+  <!-- ===================== SLOT CONTEXT MENU (right-click) ===================== -->
+  <div class="ctx-menu" id="ctx-menu" hidden></div>
 
   <!-- ===================== TOASTS ===================== -->
   <div class="toasts" id="toasts" aria-live="polite"></div>

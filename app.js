@@ -1,9 +1,12 @@
 /* AlexMenus web editor — vanilla JS SPA (js-yaml v4 is the only external dep).
  *
  * DATA FLOW
- *   load:  #k=<code>&w=<worker-url>  ->  GET <w>/<k>  ->  bundle {v,menus:[{id,yaml}]}
+ *   load:  #<code>            (bare, clean link)  -> worker = DEFAULT_WORKER
+ *          #k=<code>&w=<url>  (legacy, back-compat) -> worker from w=
+ *          -> GET <w>/<k> -> bundle {v,menus:[{id,yaml}]}
  *          -> jsyaml.load(each yaml) -> plain JS objects held in state.menus[i].obj
- *   edit:  the structured UI (grid + slot editor) and the raw-YAML textarea mutate obj
+ *   edit:  the structured UI (grid + slot editor) and the raw-YAML textarea mutate obj.
+ *          Multi-select: edits in the right panel apply to ALL selected slots (bulk).
  *   save:  jsyaml.dump(each obj) -> bundle {v:1,menus:[{id,yaml}]} -> POST <w>/post
  *          -> { key } -> show "/am apply <key>"
  * The only network calls are that initial GET and the save POST. Everything else is client-side.
@@ -14,6 +17,9 @@
   // ------------------------------------------------------------------ constants
   const ICON_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/textures/';
   const BUNDLE_VERSION = 1;
+
+  // Default paste-service Worker, used when the link is the clean `#<code>` form (no w=).
+  const DEFAULT_WORKER = 'https://alexmenus-paste.alextorx2020.workers.dev';
 
   // click-kind id -> Russian label
   const CLICK_KINDS = [
@@ -37,13 +43,18 @@
 
   // ------------------------------------------------------------------ state
   const state = {
-    workerBase: '',   // decoded Worker base URL (from hash `w`)
-    code: '',         // paste code (from hash `k`)
-    menus: [],        // [{ id, obj }]  — obj = parsed menu object
-    sel: -1,          // index of the selected menu
-    slot: null,       // selected slot index (int) or null
-    raw: false        // raw-YAML mode active?
+    workerBase: '',        // Worker base URL (from hash `w`, or DEFAULT_WORKER)
+    code: '',              // paste code (from hash)
+    menus: [],             // [{ id, obj }]  — obj = parsed menu object
+    sel: -1,               // index of the selected menu
+    selected: new Set(),   // set of selected slot indices (ints)
+    active: null,          // the slot shown in the right panel (int) or null
+    clipboard: null,       // internal copy buffer (a cloned element object)
+    raw: false             // raw-YAML mode active?
   };
+
+  // transient drag-select bookkeeping
+  const drag = { pending: false, moved: false, startSlot: null };
 
   // ------------------------------------------------------------------ tiny DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -55,13 +66,14 @@
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   const current = () => (state.sel >= 0 ? state.menus[state.sel] : null);
+  function resetSelection() { state.selected = new Set(); state.active = null; }
 
   // ================================================================== INIT
   function init() {
     wireStaticUi();
     const hash = parseHash();
-    if (!hash.k || !hash.w) {
-      // No link params -> friendly empty state explaining how to open the editor.
+    if (!hash.k) {
+      // No code -> friendly empty state explaining how to open the editor.
       show('empty-state');
       return;
     }
@@ -70,14 +82,22 @@
     loadBundle();
   }
 
-  // Parse location.hash: `#k=<code>&w=<worker-url-encoded>`
+  // Parse location.hash. Supports two forms:
+  //   `#<code>`               (bare/clean link) -> code = whole fragment, worker = DEFAULT_WORKER
+  //   `#k=<code>&w=<url-enc>`  (legacy)          -> code from k=, worker from w= (or DEFAULT_WORKER)
   function parseHash() {
-    const raw = (location.hash || '').replace(/^#/, '');
-    const p = new URLSearchParams(raw);
-    let w = p.get('w') || '';
-    try { w = decodeURIComponent(w); } catch (e) { /* already decoded */ }
-    w = w.replace(/\/+$/, ''); // trim trailing slash
-    return { k: (p.get('k') || '').trim(), w: w.trim() };
+    const raw = (location.hash || '').replace(/^#/, '').trim();
+    if (!raw) return { k: '', w: DEFAULT_WORKER };
+
+    if (/(?:^|&)[kw]=/.test(raw)) {           // param form: contains a k= or w=
+      const p = new URLSearchParams(raw);
+      let w = p.get('w') || '';
+      if (w) { try { w = decodeURIComponent(w); } catch (e) { /* already decoded */ } }
+      w = (w || DEFAULT_WORKER).replace(/\/+$/, '');
+      return { k: (p.get('k') || '').trim(), w: w.trim() };
+    }
+    // bare form: the entire fragment is the paste code
+    return { k: raw, w: DEFAULT_WORKER.replace(/\/+$/, '') };
   }
 
   // show exactly one of the top-level views; the editor view = topbar + layout together
@@ -104,7 +124,7 @@
       if (!state.menus.length) return failLoad('В бандле нет меню. Создай меню кнопкой «＋».', true);
 
       state.sel = 0;
-      state.slot = null;
+      resetSelection();
       show('editor');
       renderAll();
     } catch (e) {
@@ -128,9 +148,9 @@
     $('es-msg').textContent = msg;
     show('empty-state');
     if (allowNew) {
-      // let the user build menus even without a valid bundle
       state.menus = [];
       state.sel = -1;
+      resetSelection();
       show('editor');
       renderAll();
     }
@@ -196,7 +216,7 @@
     if (i === state.sel) return;
     if (!commitRaw()) return; // don't switch away from invalid raw YAML
     state.sel = i;
-    state.slot = null;
+    resetSelection();
     renderAll();
   }
 
@@ -213,16 +233,17 @@
 
     if (type === 'chest') {
       rowsField.hidden = false;
-      const rows = rowsOf(m.obj);
       const inp = $('menu-rows');
-      inp.value = rows;
+      inp.value = rowsOf(m.obj);
       inp.onchange = () => {
         let v = parseInt(inp.value, 10);
         if (isNaN(v)) v = 1;
         v = Math.max(1, Math.min(6, v));
         m.obj.rows = v;
         inp.value = v;
-        if (state.slot != null && state.slot >= v * 9) state.slot = null;
+        // drop selection/active that fell outside the new grid
+        state.selected = new Set([...state.selected].filter((s) => s < v * 9));
+        if (state.active != null && state.active >= v * 9) state.active = null;
         renderGrid();
         renderProps();
       };
@@ -238,123 +259,205 @@
     const grid = $('slot-grid');
     const hint = $('grid-hint');
     clear(grid);
-    if (!m) return;
+    if (!m) { updateSelCounter(); return; }
 
     const type = m.obj.type || 'chest';
     if (type !== 'chest' && type !== 'inventory') {
       grid.style.display = 'none';
       hint.textContent = 'Тип «' + type + '» редактируется через «Сырой YAML» (кнопка сверху).';
+      $('sel-count').hidden = true;
       return;
     }
     grid.style.display = 'grid';
-    hint.textContent = 'Клик по ячейке — выбрать / создать элемент.';
+    hint.textContent = 'ЛКМ — выбрать · Ctrl — добавить · Shift — диапазон · тянуть — рамкой · ПКМ — меню';
 
     const count = type === 'inventory' ? 27 : rowsOf(m.obj) * 9;
     const items = m.obj.items || {};
-    for (let s = 0; s < count; s++) {
-      grid.append(buildCell(items[String(s)], s));
-    }
+    for (let s = 0; s < count; s++) grid.append(buildCell(items[String(s)], s));
+    updateSelCounter();
   }
 
   function buildCell(item, slot) {
     const cell = el('div', 'cell');
+    cell.dataset.slot = String(slot);
     cell.append(el('span', 'cell-num', String(slot)));
     if (item) {
       cell.classList.add('filled');
       cell.append(buildIcon(item.material, 'cell-ic', 'cell-txt'));
     }
-    if (state.slot === slot) cell.classList.add('selected');
-    cell.onclick = () => onCellClick(slot);
+    if (state.selected.has(slot)) cell.classList.add('selected');
+    if (state.active === slot) cell.classList.add('active');
+    cell.addEventListener('mousedown', (e) => onCellMouseDown(e, slot));
+    cell.addEventListener('mouseenter', (e) => onCellMouseEnter(e, slot));
+    cell.addEventListener('contextmenu', (e) => onCellContext(e, slot));
     return cell;
   }
 
-  // select a slot; create a default element on an empty cell (per spec)
-  function onCellClick(slot) {
+  // ---------- selection interactions ----------
+  // Plain click: select only this cell (+create element). Ctrl/Cmd: toggle in selection.
+  // Shift: rectangular range from active to this cell. Drag: rubber-select a fresh region.
+  function onCellMouseDown(e, slot) {
+    if (e.button !== 0) return;   // left only; right is handled by contextmenu
+    hideContextMenu();
     const m = current();
     if (!m) return;
-    if (!m.obj.items || typeof m.obj.items !== 'object') m.obj.items = {};
-    if (!m.obj.items[String(slot)]) m.obj.items[String(slot)] = { material: 'STONE' };
-    state.slot = slot;
+    drag.pending = true; drag.moved = false; drag.startSlot = slot;
+
+    if (e.shiftKey && state.active != null) {
+      selectRange(state.active, slot);
+    } else if (e.ctrlKey || e.metaKey) {
+      if (state.selected.has(slot)) state.selected.delete(slot);
+      else state.selected.add(slot);
+      state.active = slot;
+    } else {
+      ensureElement(slot);        // plain click on empty cell creates an element
+      state.selected = new Set([slot]);
+      state.active = slot;
+    }
     renderGrid();
     renderProps();
   }
 
-  // ---------- right panel (slot editor) ----------
+  function onCellMouseEnter(e, slot) {
+    if (!drag.pending) return;
+    drag.moved = true;
+    state.selected.add(slot);
+    state.active = slot;
+    paintSelection();             // lightweight: update classes, don't rebuild the grid mid-drag
+  }
+
+  function onDocMouseUp() {
+    if (!drag.pending) return;
+    drag.pending = false;
+    if (drag.moved) renderProps(); // finalize the right panel for the dragged selection
+  }
+
+  function onCellContext(e, slot) {
+    e.preventDefault();
+    const m = current();
+    if (!m) return;
+    // if the right-clicked cell isn't part of the selection, select just it first
+    if (!state.selected.has(slot)) { state.selected = new Set([slot]); }
+    state.active = slot;
+    renderGrid();
+    renderProps();
+    openContextMenu(e.clientX, e.clientY);
+  }
+
+  // rectangular bounding box between two slots in the 9-wide grid
+  function selectRange(a, b) {
+    const W = 9, cnt = gridCount();
+    const ar = Math.floor(a / W), ac = a % W, br = Math.floor(b / W), bc = b % W;
+    const r0 = Math.min(ar, br), r1 = Math.max(ar, br), c0 = Math.min(ac, bc), c1 = Math.max(ac, bc);
+    state.selected = new Set();
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+      const s = r * W + c;
+      if (s < cnt) state.selected.add(s);
+    }
+    state.active = b;
+  }
+
+  // update .selected / .active classes without rebuilding cells (used during drag)
+  function paintSelection() {
+    $('slot-grid').querySelectorAll('.cell').forEach((c) => {
+      const s = parseInt(c.dataset.slot, 10);
+      c.classList.toggle('selected', state.selected.has(s));
+      c.classList.toggle('active', state.active === s);
+    });
+    updateSelCounter();
+  }
+
+  function updateSelCounter() {
+    const n = state.selected.size;
+    const e = $('sel-count');
+    if (n > 1) { e.hidden = false; e.textContent = n + ' выделено'; }
+    else e.hidden = true;
+  }
+
+  // ---------- right panel (slot editor, with bulk-apply to all selected) ----------
   function renderProps() {
     const m = current();
     const empty = $('slot-empty');
     const body = $('slot-editor');
-    const item = (m && state.slot != null && m.obj.items) ? m.obj.items[String(state.slot)] : null;
+    if (!m || state.active == null) { empty.hidden = false; body.hidden = true; return; }
 
-    if (!item) { empty.hidden = false; body.hidden = true; return; }
+    const real = (m.obj.items && m.obj.items[String(state.active)]) || null;
+    const disp = real || {};      // display values come from the active slot (blank if empty)
     empty.hidden = true; body.hidden = false;
 
-    $('slot-num').textContent = String(state.slot);
+    // bulk banner: shown when edits will touch more than one slot
+    const n = targetSlots().length;
+    const banner = $('bulk-banner');
+    if (n > 1) { banner.hidden = false; banner.textContent = 'Правки применяются к ' + n + ' слотам'; }
+    else banner.hidden = true;
 
-    // material (+ live icon)
+    $('slot-num').textContent = n > 1 ? (state.active + ' + ещё ' + (n - 1)) : String(state.active);
+
+    // material (+ live icon) — bulk
     const fMat = $('f-material');
-    fMat.value = item.material != null ? String(item.material) : '';
-    setMatIcon(item.material);
-    fMat.oninput = () => { item.material = fMat.value; };
-    fMat.onchange = () => { setMatIcon(item.material); renderGrid(); };
+    fMat.value = disp.material != null ? String(disp.material) : '';
+    setMatIcon(disp.material);
+    fMat.oninput = () => applyBulk((it) => { it.material = fMat.value; }, false);
+    fMat.onchange = () => { setMatIcon(fMat.value); renderGrid(); };
 
-    // cmd (custom-model-data) — kept as string
+    // cmd (custom-model-data) — bulk
     const fCmd = $('f-cmd');
-    fCmd.value = item.cmd != null ? String(item.cmd) : '';
-    fCmd.oninput = () => { setOrDel(item, 'cmd', fCmd.value); };
+    fCmd.value = disp.cmd != null ? String(disp.cmd) : '';
+    fCmd.oninput = () => applyBulk((it) => setOrDel(it, 'cmd', fCmd.value), false);
 
-    // name
+    // name — bulk
     const fName = $('f-name');
-    fName.value = item.name != null ? String(item.name) : '';
-    fName.oninput = () => { setOrDel(item, 'name', fName.value); };
+    fName.value = disp.name != null ? String(disp.name) : '';
+    fName.oninput = () => applyBulk((it) => setOrDel(it, 'name', fName.value), false);
 
-    // lore (one line per row)
+    // lore (one line per row) — bulk
     const fLore = $('f-lore');
-    fLore.value = Array.isArray(item.lore) ? item.lore.join('\n') : (item.lore ? String(item.lore) : '');
-    fLore.oninput = () => {
-      const lines = fLore.value.split('\n');
-      if (fLore.value.trim() === '') delete item.lore;
-      else item.lore = lines;
-    };
+    fLore.value = Array.isArray(disp.lore) ? disp.lore.join('\n') : (disp.lore ? String(disp.lore) : '');
+    fLore.oninput = () => applyBulk((it) => {
+      if (fLore.value.trim() === '') delete it.lore;
+      else it.lore = fLore.value.split('\n');
+    }, false);
 
-    renderFlags(item);
-    renderClicks(item);
+    renderFlags(disp);
+    renderClicks(disp);
   }
 
-  function renderFlags(item) {
+  function renderFlags(disp) {
     const wrap = $('f-flags');
     clear(wrap);
-    const flags = Array.isArray(item.flags) ? item.flags : [];
+    const flags = Array.isArray(disp.flags) ? disp.flags : [];
     HIDE_FLAGS.forEach((flag) => {
       const lab = el('label', 'check');
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.checked = flags.indexOf(flag) !== -1;
-      cb.onchange = () => {
-        let arr = Array.isArray(item.flags) ? item.flags.slice() : [];
+      cb.onchange = () => applyBulk((it) => {
+        let arr = Array.isArray(it.flags) ? it.flags.slice() : [];
         if (cb.checked) { if (arr.indexOf(flag) === -1) arr.push(flag); }
         else { arr = arr.filter((f) => f !== flag); }
-        if (arr.length) item.flags = arr; else delete item.flags;
-      };
+        if (arr.length) it.flags = arr; else delete it.flags;
+      }, false);
       lab.append(cb, el('span', null, flag.replace('HIDE_', '')));
       wrap.append(lab);
     });
 
     const hideAll = $('f-hideall');
-    hideAll.checked = item['hide-all'] === true;
-    hideAll.onchange = () => {
-      if (hideAll.checked) item['hide-all'] = true; else delete item['hide-all'];
-    };
+    hideAll.checked = disp['hide-all'] === true;
+    hideAll.onchange = () => applyBulk((it) => {
+      if (hideAll.checked) it['hide-all'] = true; else delete it['hide-all'];
+    }, false);
   }
 
   // ---------- clicks editor (per click-kind: list of action rows) ----------
-  function renderClicks(item) {
+  // Reads from the active slot; structural changes mutate the active element and, when
+  // more than one slot is selected, propagate the whole clicks object to all targets.
+  function renderClicks(disp) {
     const wrap = $('f-clicks');
     clear(wrap);
-    if (!item.clicks || typeof item.clicks !== 'object') item.clicks = {};
+    const clicks = (disp && disp.clicks && typeof disp.clicks === 'object') ? disp.clicks : {};
 
     CLICK_KINDS.forEach(([kind, label]) => {
-      const actions = Array.isArray(item.clicks[kind]) ? item.clicks[kind] : null;
+      const actions = Array.isArray(clicks[kind]) ? clicks[kind] : null;
       const block = el('div', 'click-kind');
 
       const head = el('div', 'ck-head');
@@ -363,14 +466,17 @@
       block.append(head);
 
       const bodyEl = el('div', 'ck-body');
-      if (actions) {
-        actions.forEach((a, idx) => bodyEl.append(buildActionRow(item, kind, idx)));
-      }
+      if (actions) actions.forEach((a, idx) => bodyEl.append(buildActionRow(kind, idx)));
+
       const add = el('button', 'btn small add-action', '＋ действие');
       add.onclick = () => {
-        if (!Array.isArray(item.clicks[kind])) item.clicks[kind] = [];
-        item.clicks[kind].push({ type: 'run_command', command: '', as: 'player' });
-        renderClicks(item);
+        const real = ensureActiveElement();
+        if (!real.clicks) real.clicks = {};
+        if (!Array.isArray(real.clicks[kind])) real.clicks[kind] = [];
+        real.clicks[kind].push({ type: 'run_command', command: '', as: 'player' });
+        propagateClicksIfBulk();
+        renderGrid();   // active may have become filled
+        renderProps();
       };
       bodyEl.append(add);
       block.append(bodyEl);
@@ -378,8 +484,9 @@
     });
   }
 
-  function buildActionRow(item, kind, idx) {
-    const actions = item.clicks[kind];
+  function buildActionRow(kind, idx) {
+    const real = activeItem();
+    const actions = real.clicks[kind];
     const a = actions[idx];
     const row = el('div', 'action-row');
 
@@ -391,20 +498,22 @@
       sel.append(o);
     });
     sel.value = a.type || 'run_command';
-    sel.onchange = () => { actions[idx] = defaultAction(sel.value); renderClicks(item); };
+    sel.onchange = () => { actions[idx] = defaultAction(sel.value); propagateClicksIfBulk(); renderProps(); };
 
     const del = el('button', 'btn icon', '×');
     del.title = 'Удалить действие';
     del.onclick = () => {
       actions.splice(idx, 1);
-      if (!actions.length) delete item.clicks[kind];
-      renderClicks(item);
+      if (!actions.length) delete real.clicks[kind];
+      if (!Object.keys(real.clicks).length) delete real.clicks;
+      propagateClicksIfBulk();
+      renderProps();
     };
     top.append(sel, del);
     row.append(top);
 
     const fields = el('div', 'action-fields');
-    buildActionFields(fields, a);
+    buildActionFields(fields, a); // field inputs mutate `a`; #f-clicks delegated listener propagates
     row.append(fields);
     return row;
   }
@@ -499,6 +608,69 @@
     else obj[key] = val;
   }
 
+  // ================================================================== BULK-EDIT helpers
+  // The slots a right-panel edit writes to = the selection ∪ the active slot.
+  function targetSlots() {
+    const s = new Set(state.selected);
+    if (state.active != null) s.add(state.active);
+    return [...s];
+  }
+  // active slot's element (may be null if the active slot is empty)
+  function activeItem() {
+    const m = current();
+    if (!m || state.active == null || !m.obj.items) return null;
+    return m.obj.items[String(state.active)] || null;
+  }
+  // ensure an element exists at the active slot, return it
+  function ensureActiveElement() {
+    const m = current();
+    if (!m) return null;
+    if (!m.obj.items) m.obj.items = {};
+    const k = String(state.active);
+    if (!m.obj.items[k]) m.obj.items[k] = { material: 'STONE' };
+    return m.obj.items[k];
+  }
+  function ensureElement(slot) {
+    const m = current();
+    if (!m) return;
+    if (!m.obj.items) m.obj.items = {};
+    if (!m.obj.items[String(slot)]) m.obj.items[String(slot)] = { material: 'STONE' };
+  }
+  // element objects for every target slot (creating a default where empty)
+  function targetItems() {
+    const m = current();
+    if (!m) return [];
+    if (!m.obj.items) m.obj.items = {};
+    return targetSlots().map((slot) => {
+      const k = String(slot);
+      if (!m.obj.items[k]) m.obj.items[k] = { material: 'STONE' };
+      return m.obj.items[k];
+    });
+  }
+  function filledCount() {
+    const m = current();
+    return (m && m.obj.items) ? Object.keys(m.obj.items).length : 0;
+  }
+  // apply a mutation to every target element; regrid only if the filled set changed (or forced)
+  function applyBulk(fn, forceGrid) {
+    const before = filledCount();
+    targetItems().forEach(fn);
+    updateSelCounter();
+    if (forceGrid || filledCount() !== before) renderGrid();
+  }
+  // copy the active slot's clicks object to all other target slots (bulk clicks editing)
+  function propagateClicks() {
+    const src = activeItem();
+    if (!src) return;
+    const clone = src.clicks ? JSON.parse(JSON.stringify(src.clicks)) : null;
+    targetItems().forEach((it) => {
+      if (it === src) return;
+      if (clone === null) delete it.clicks;
+      else it.clicks = JSON.parse(JSON.stringify(clone));
+    });
+  }
+  function propagateClicksIfBulk() { if (targetSlots().length > 1) propagateClicks(); }
+
   // ================================================================== ICONS (best-effort)
   // Try textures/item/<name>.png, then block/<name>.png; on failure show short material text.
   function buildIcon(material, imgCls, txtCls) {
@@ -560,7 +732,6 @@
 
   function toggleRaw() {
     if (state.raw) {
-      // leaving raw mode: keep old object if the YAML is invalid
       if (!commitRaw()) { toast('Исправь YAML, затем выключи режим', 'err'); return; }
       state.raw = false;
       renderAll();
@@ -605,7 +776,7 @@
 
     state.menus.push({ id, obj });
     state.sel = state.menus.length - 1;
-    state.slot = null;
+    resetSelection();
     $('newmenu-modal').hidden = true;
     renderAll();
     toast('Меню «' + id + '» создано', 'ok');
@@ -621,7 +792,7 @@
     const clone = JSON.parse(JSON.stringify(m.obj)); // plain data -> safe deep clone
     state.menus.push({ id, obj: clone });
     state.sel = state.menus.length - 1;
-    state.slot = null;
+    resetSelection();
     renderAll();
     toast('Дубликат: «' + id + '»', 'ok');
   }
@@ -632,17 +803,89 @@
     if (!window.confirm('Удалить меню «' + m.id + '»? Действие применится после сохранения.')) return;
     state.menus.splice(state.sel, 1);
     state.sel = state.menus.length ? Math.max(0, state.sel - 1) : -1;
-    state.slot = null;
+    resetSelection();
     state.raw = false;
     renderAll();
     if (!state.menus.length) $('cur-menu-id').textContent = '—';
   }
 
-  // ================================================================== SLOT actions
+  // ================================================================== SLOT actions (bulk)
   function clearSlot() {
     const m = current();
-    if (!m || state.slot == null) return;
-    if (m.obj.items) delete m.obj.items[String(state.slot)];
+    if (!m || !m.obj.items) return;
+    targetSlots().forEach((s) => delete m.obj.items[String(s)]);
+    renderGrid();
+    renderProps();
+  }
+
+  // ================================================================== CONTEXT MENU (right-click)
+  function hideContextMenu() { $('ctx-menu').hidden = true; }
+
+  function openContextMenu(x, y) {
+    const menu = $('ctx-menu');
+    clear(menu);
+    buildContextItems().forEach((it) => {
+      if (it.sep) { menu.append(el('div', 'ctx-sep')); return; }
+      const row = el('div', 'ctx-item' + (it.enabled === false ? ' disabled' : ''), it.label);
+      if (it.enabled !== false) {
+        // mousedown (not click) so it fires before the document-level close handler
+        row.addEventListener('mousedown', (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          hideContextMenu();
+          it.fn();
+        });
+      }
+      menu.append(row);
+    });
+    menu.hidden = false;
+    // clamp to viewport
+    const rect = menu.getBoundingClientRect();
+    let px = x, py = y;
+    if (px + rect.width > window.innerWidth) px = Math.max(4, window.innerWidth - rect.width - 6);
+    if (py + rect.height > window.innerHeight) py = Math.max(4, window.innerHeight - rect.height - 6);
+    menu.style.left = px + 'px';
+    menu.style.top = py + 'px';
+  }
+
+  function buildContextItems() {
+    const n = targetSlots().length;
+    const activeHas = !!activeItem();
+    return [
+      { label: 'Редактировать', fn: () => { const f = $('f-material'); if (f) f.focus(); } },
+      { label: 'Копировать', enabled: activeHas, fn: () => { state.clipboard = JSON.parse(JSON.stringify(activeItem())); toast('Скопировано в буфер', 'ok'); } },
+      { label: n > 1 ? ('Вставить в выделенные (' + n + ')') : 'Вставить', enabled: !!state.clipboard, fn: () => { pasteInto(targetSlots(), state.clipboard); renderGrid(); renderProps(); } },
+      { label: 'Дублировать в выделенные', enabled: activeHas && n > 1, fn: () => { dupIntoSelected(); renderGrid(); renderProps(); } },
+      { label: n > 1 ? ('Очистить выделенные (' + n + ')') : 'Очистить', fn: () => { clearSlot(); } },
+      { sep: true },
+      { label: 'Выделить всё', fn: () => { selectAll(); } },
+      { label: 'Снять выделение', fn: () => { clearSelection(); } }
+    ];
+  }
+
+  function pasteInto(slots, elObj) {
+    const m = current();
+    if (!m || !elObj) return;
+    if (!m.obj.items) m.obj.items = {};
+    slots.forEach((s) => { m.obj.items[String(s)] = JSON.parse(JSON.stringify(elObj)); });
+  }
+  function dupIntoSelected() {
+    const src = activeItem();
+    if (!src) return;
+    const m = current();
+    if (!m.obj.items) m.obj.items = {};
+    targetSlots().forEach((s) => { if (s !== state.active) m.obj.items[String(s)] = JSON.parse(JSON.stringify(src)); });
+  }
+  function selectAll() {
+    const c = gridCount();
+    const s = new Set();
+    for (let i = 0; i < c; i++) s.add(i);
+    state.selected = s;
+    if (state.active == null && c > 0) state.active = 0;
+    renderGrid();
+    renderProps();
+  }
+  function clearSelection() {
+    resetSelection();
     renderGrid();
     renderProps();
   }
@@ -680,6 +923,14 @@
     if (isNaN(r)) r = 3;
     return Math.max(1, Math.min(6, r));
   }
+  // number of grid cells for the current menu (0 for non-grid types)
+  function gridCount() {
+    const m = current();
+    if (!m) return 0;
+    const t = m.obj.type || 'chest';
+    if (t !== 'chest' && t !== 'inventory') return 0;
+    return t === 'inventory' ? 27 : rowsOf(m.obj) * 9;
+  }
 
   // ================================================================== static wiring
   function wireStaticUi() {
@@ -691,6 +942,19 @@
     $('dup-menu-btn').onclick = duplicateMenu;
     $('del-menu-btn').onclick = deleteMenu;
     $('clear-slot-btn').onclick = clearSlot;
+
+    // bulk clicks: any field edit inside #f-clicks propagates to all selected slots
+    $('f-clicks').addEventListener('input', () => { if (targetSlots().length > 1) propagateClicks(); });
+    $('f-clicks').addEventListener('change', () => { if (targetSlots().length > 1) propagateClicks(); });
+
+    // drag-select finishes anywhere on the page
+    document.addEventListener('mouseup', onDocMouseUp);
+
+    // context menu: close when clicking outside it
+    document.addEventListener('mousedown', (e) => {
+      const menu = $('ctx-menu');
+      if (!menu.hidden && !menu.contains(e.target)) hideContextMenu();
+    });
 
     // new-menu modal
     $('nm-create').onclick = createMenu;
@@ -704,12 +968,16 @@
     $('sm-copy').onclick = copyCode;
     $('sm-close').onclick = () => { $('save-modal').hidden = true; };
 
-    // close overlays on backdrop click / Esc
+    // close overlays on backdrop click
     document.querySelectorAll('.overlay').forEach((ov) => {
       ov.addEventListener('mousedown', (e) => { if (e.target === ov) ov.hidden = true; });
     });
+    // Esc closes overlays and the context menu
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') document.querySelectorAll('.overlay').forEach((o) => (o.hidden = true));
+      if (e.key === 'Escape') {
+        document.querySelectorAll('.overlay').forEach((o) => (o.hidden = true));
+        hideContextMenu();
+      }
     });
   }
 
