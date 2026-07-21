@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AlexMenus — редактор меню</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!--
+    AlexMenus web editor (LuckPerms-style paste flow).
+    Data flow:
+      1. Link opened as  #k=<code>&w=<worker-url-encoded>
+      2. GET  <w>/<k>   -> bundle { v:1, menus:[{id, yaml}] }
+      3. jsyaml.load each menu's yaml -> plain JS object (edited in the UI)
+      4. "Сохранить": jsyaml.dump each object, POST bundle to <w>/post -> { key }
+         -> show the new code + "/am apply <code>"
+  -->
+
+  <!-- ===================== TOP BAR ===================== -->
+  <header class="topbar" id="topbar" hidden>
+    <div class="brand">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="wordmark">AlexMenus</span>
+      <span class="sep" aria-hidden="true">/</span>
+      <span class="cur-menu" id="cur-menu-id">—</span>
+    </div>
+    <div class="top-actions">
+      <button class="btn toggle" id="raw-toggle" type="button" aria-pressed="false">
+        <span class="tog-box" aria-hidden="true"></span> Сырой YAML
+      </button>
+      <button class="btn primary" id="save-btn" type="button">Сохранить и получить код</button>
+    </div>
+  </header>
+
+  <!-- ===================== MAIN LAYOUT ===================== -->
+  <main class="layout" id="layout" hidden>
+
+    <!-- ---------- LEFT SIDEBAR: menu list ---------- -->
+    <aside class="sidebar" id="sidebar">
+      <div class="side-head">
+        <span class="side-title">Меню</span>
+        <button class="btn icon" id="new-menu-btn" type="button" title="Новое меню" aria-label="Новое меню">＋</button>
+      </div>
+      <ul class="menu-list" id="menu-list"></ul>
+      <div class="side-foot">
+        <button class="btn small" id="dup-menu-btn" type="button">Дублировать</button>
+        <button class="btn small danger-ghost" id="del-menu-btn" type="button">Удалить</button>
+      </div>
+    </aside>
+
+    <!-- ---------- CENTER: slot grid / raw yaml ---------- -->
+    <section class="center" id="center">
+      <div class="center-toolbar" id="center-toolbar">
+        <label class="field grow">
+          <span class="lbl">Заголовок (title)</span>
+          <input type="text" id="menu-title" class="in" placeholder="<gradient:...>Меню</gradient>" />
+        </label>
+        <label class="field rows-field" id="rows-field">
+          <span class="lbl">Рядов</span>
+          <input type="number" id="menu-rows" class="in" min="1" max="6" step="1" />
+        </label>
+      </div>
+
+      <div class="grid-wrap" id="grid-wrap">
+        <div class="slot-grid" id="slot-grid"></div>
+        <p class="grid-hint" id="grid-hint">Клик по ячейке — выбрать/создать элемент.</p>
+      </div>
+
+      <!-- Raw YAML escape hatch (triggers, open-requirement, conditional, dialog, ...) -->
+      <div class="raw-wrap" id="raw-wrap" hidden>
+        <textarea id="raw-yaml" class="raw-area" spellcheck="false"
+                  aria-label="Сырой YAML текущего меню"></textarea>
+        <div class="raw-err" id="raw-err" hidden></div>
+      </div>
+    </section>
+
+    <!-- ---------- RIGHT PANEL: slot editor ---------- -->
+    <aside class="props" id="props">
+      <div class="props-empty" id="slot-empty">
+        <p class="muted">Слот не выбран.</p>
+        <p class="faint">Выбери ячейку в сетке слева, чтобы задать материал, имя, лор и действия по кликам.</p>
+      </div>
+
+      <div class="props-body" id="slot-editor" hidden>
+        <div class="props-head">
+          <span class="props-title">Слот <b id="slot-num">0</b></span>
+          <button class="btn small danger-ghost" id="clear-slot-btn" type="button">Очистить слот</button>
+        </div>
+
+        <label class="field">
+          <span class="lbl">Материал (material)</span>
+          <div class="mat-row">
+            <span class="mat-ic" id="mat-ic" aria-hidden="true"></span>
+            <input type="text" id="f-material" class="in" placeholder="STONE / minecraft:paper" />
+          </div>
+        </label>
+
+        <label class="field">
+          <span class="lbl">custom-model-data (cmd)</span>
+          <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
+        </label>
+
+        <label class="field">
+          <span class="lbl">Имя (name, MiniMessage)</span>
+          <input type="text" id="f-name" class="in" placeholder="<green>Кнопка" />
+        </label>
+
+        <label class="field">
+          <span class="lbl">Лор (lore, по строке на ряд)</span>
+          <textarea id="f-lore" class="in area" rows="3" placeholder="<gray>Первая строка&#10;<gray>Вторая строка"></textarea>
+        </label>
+
+        <div class="field">
+          <span class="lbl">Флаги (скрытие тултипов)</span>
+          <div class="flags" id="f-flags"></div>
+          <label class="check hideall">
+            <input type="checkbox" id="f-hideall" />
+            <span>Скрыть всё (hide-all)</span>
+          </label>
+        </div>
+
+        <div class="field">
+          <div class="clicks-head">
+            <span class="lbl">Действия по кликам (clicks)</span>
+          </div>
+          <div class="clicks" id="f-clicks"></div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- ===================== EMPTY STATE (no hash) ===================== -->
+  <section class="empty-state" id="empty-state" hidden>
+    <div class="es-card">
+      <div class="brand big">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="wordmark">AlexMenus</span>
+      </div>
+      <h1>Редактор меню</h1>
+      <p class="muted" id="es-msg">
+        Эту страницу нужно открывать по ссылке из игры.
+      </p>
+      <ol class="es-steps">
+        <li>Зайди на сервер и выполни <code>/am editor</code>.</li>
+        <li>Нажми на присланную ссылку — она содержит код и адрес.</li>
+        <li>Отредактируй меню и нажми <b>«Сохранить»</b>.</li>
+        <li>Применить правки в игре: <code>/am apply &lt;код&gt;</code>.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ===================== LOADING ===================== -->
+  <section class="loading" id="loading" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <p class="muted">Загрузка меню…</p>
+  </section>
+
+  <!-- ===================== NEW-MENU MODAL ===================== -->
+  <div class="overlay" id="newmenu-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="nm-title">
+      <h2 id="nm-title">Новое меню</h2>
+      <label class="field">
+        <span class="lbl">ID меню (без пробелов)</span>
+        <input type="text" id="nm-id" class="in" placeholder="shop" autocomplete="off" />
+      </label>
+      <div class="field">
+        <span class="lbl">Тип</span>
+        <div class="type-cards" id="nm-types">
+          <button type="button" class="type-card active" data-type="chest">
+            <b>chest</b><span class="faint">сундук, 1–6 рядов</span>
+          </button>
+          <button type="button" class="type-card" data-type="inventory">
+            <b>inventory</b><span class="faint">инвентарь, 27 слотов</span>
+          </button>
+        </div>
+      </div>
+      <div class="nm-err" id="nm-err" hidden></div>
+      <div class="modal-actions">
+        <button class="btn" id="nm-cancel" type="button">Отмена</button>
+        <button class="btn primary" id="nm-create" type="button">Создать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== SAVE / CODE MODAL ===================== -->
+  <div class="overlay" id="save-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="sm-title">
+      <h2 id="sm-title">Код сохранён</h2>
+      <p class="muted">Применить правки в игре командой:</p>
+      <div class="code-box">
+        <code id="sm-cmd">/am apply —</code>
+        <button class="btn small" id="sm-copy" type="button">Копировать</button>
+      </div>
+      <p class="faint">Код действует ограниченное время. Если он истёк — сохрани заново.</p>
+      <div class="modal-actions">
+        <button class="btn primary" id="sm-close" type="button">Готово</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== TOASTS ===================== -->
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <!-- js-yaml v4 (only external dependency) -->
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
