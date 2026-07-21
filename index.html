@@ -26,6 +26,9 @@
       <span class="cur-menu" id="cur-menu-id">—</span>
     </div>
     <div class="top-actions">
+      <button class="btn toggle" id="graph-toggle" type="button" aria-pressed="false">
+        <span class="tog-box" aria-hidden="true"></span> Граф
+      </button>
       <button class="btn toggle" id="raw-toggle" type="button" aria-pressed="false">
         <span class="tog-box" aria-hidden="true"></span> Сырой YAML
       </button>
@@ -63,6 +66,29 @@
         <div class="sel-count" id="sel-count" hidden></div>
       </div>
 
+      <!-- Menu-level settings (top-level YAML keys) -->
+      <details class="menu-settings" id="menu-settings">
+        <summary>Настройки меню</summary>
+        <div class="ms-grid">
+          <label class="field">
+            <span class="lbl">Право (permission)</span>
+            <input type="text" id="ms-permission" class="in" placeholder="напр. menus.shop" />
+          </label>
+          <label class="field">
+            <span class="lbl">Команды (через запятую)</span>
+            <input type="text" id="ms-commands" class="in" placeholder="shop, магазин" />
+          </label>
+          <label class="field ms-wide">
+            <span class="lbl">Описание команды (command-description)</span>
+            <input type="text" id="ms-cmd-desc" class="in" placeholder="Открыть магазин" />
+          </label>
+          <label class="check ms-help">
+            <input type="checkbox" id="ms-show-help" checked />
+            <span>Показывать в /help (show-in-help)</span>
+          </label>
+        </div>
+      </details>
+
       <div class="grid-wrap" id="grid-wrap">
         <div class="slot-grid" id="slot-grid"></div>
         <p class="grid-hint" id="grid-hint">Клик по ячейке — выбрать/создать элемент.</p>
@@ -73,6 +99,12 @@
         <textarea id="raw-yaml" class="raw-area" spellcheck="false"
                   aria-label="Сырой YAML текущего меню"></textarea>
         <div class="raw-err" id="raw-err" hidden></div>
+      </div>
+
+      <!-- Navigation graph (read-only view of open_menu links between menus) -->
+      <div class="graph-wrap" id="graph-wrap" hidden>
+        <svg id="graph-svg" aria-label="Граф навигации по меню"></svg>
+        <div class="graph-empty" id="graph-empty" hidden>Нет меню для отображения графа.</div>
       </div>
     </section>
 

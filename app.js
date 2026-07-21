@@ -17,10 +17,12 @@
   // ------------------------------------------------------------------ constants
   const ICON_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/textures/';
   const MODEL_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/models/';
+  const ITEMDEF_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/items/'; // 1.21.4 item-definitions
   // face-texture priority lists for resolving a cube's top/side from a model's textures map
   const TOP_KEYS = ['up', 'top', 'end', 'all', 'side', 'north', 'texture', 'particle', 'wall', 'cross'];
   const SIDE_KEYS = ['side', 'north', 'west', 'south', 'east', 'all', 'texture', 'particle', 'wall', 'up', 'top'];
   const modelCache = new Map();   // model path -> Promise<json|null>  (dedupes CDN fetches)
+  const itemDefCache = new Map(); // item name -> Promise<json|null>   (1.21.4 item-definitions)
   const BUNDLE_VERSION = 1;
 
   // Default paste-service Worker, used when the link is the clean `#<code>` form (no w=).
@@ -55,11 +57,17 @@
     selected: new Set(),   // set of selected slot indices (ints)
     active: null,          // the slot shown in the right panel (int) or null
     clipboard: null,       // internal copy buffer (a cloned element object)
-    raw: false             // raw-YAML mode active?
+    raw: false,            // raw-YAML mode active?
+    graph: false           // navigation-graph view active?
   };
 
   // transient drag-select bookkeeping
   const drag = { pending: false, moved: false, startSlot: null };
+
+  // graph-view bookkeeping (node positions persist across renders so drags stick)
+  const graphPos = {};         // menu/ghost id -> { x, y } center
+  let graphNodes = [];         // current node list
+  let graphEdges = [];         // [{ from, to, node(SVG el) }]
 
   // ------------------------------------------------------------------ tiny DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -195,8 +203,9 @@
   function renderAll() {
     renderSidebar();
     renderCenter();
+    renderMenuSettings();
     renderProps();
-    syncRawMode();
+    syncModes();
     const m = current();
     $('cur-menu-id').textContent = m ? m.id : '—';
   }
@@ -256,6 +265,34 @@
       rowsField.hidden = true;
     }
     renderGrid();
+  }
+
+  // ---------- menu-settings (top-level menu keys the plugin supports) ----------
+  function renderMenuSettings() {
+    const m = current();
+    const box = $('menu-settings');
+    if (!m) { box.hidden = true; return; }
+    box.hidden = false;
+
+    const perm = $('ms-permission');
+    perm.value = m.obj.permission != null ? String(m.obj.permission) : '';
+    perm.oninput = () => setOrDel(m.obj, 'permission', perm.value);
+
+    const cmds = $('ms-commands');
+    cmds.value = Array.isArray(m.obj.commands) ? m.obj.commands.join(', ') : (m.obj.commands != null ? String(m.obj.commands) : '');
+    cmds.oninput = () => {
+      const list = cmds.value.split(',').map((s) => s.trim()).filter(Boolean);
+      if (list.length) m.obj.commands = list; else delete m.obj.commands;
+    };
+
+    const desc = $('ms-cmd-desc');
+    desc.value = m.obj['command-description'] != null ? String(m.obj['command-description']) : '';
+    desc.oninput = () => setOrDel(m.obj, 'command-description', desc.value);
+
+    // show-in-help defaults to true; write `false` only when unchecked (omit true to keep YAML clean)
+    const help = $('ms-show-help');
+    help.checked = m.obj['show-in-help'] !== false;
+    help.onchange = () => { if (help.checked) delete m.obj['show-in-help']; else m.obj['show-in-help'] = false; };
   }
 
   // chest = rows*9 cells; inventory = 27; other types -> note (edit via raw YAML)
@@ -709,13 +746,10 @@
     const front = ('front' in tex) ? resolveRef(tex.front, tex) : null;
     return { kind: 'cube', top: top || side, side: side || top, front };
   }
-  // classify a material -> {kind:'flat',tex} | {kind:'cube',top,side,front} | {kind:'blank'}
-  async function resolveIconModel(name) {
-    let model = await fetchModelJson('item/' + name);
-    if (!model) {
-      model = (await fetchModelJson('block/' + name)) || (await fetchModelJson('block/' + name + '_inventory'));
-      if (!model) return { kind: 'blank' };
-    }
+  // walk a model file (by path) up its parent chain -> {kind:'flat'|'cube'|'blank'} | null if missing
+  async function walkModel(startPath) {
+    let model = await fetchModelJson(startPath);
+    if (!model) return null;
     const tex = {};
     for (let hops = 0; model && hops < 14; hops++) {
       if (model.textures) for (const k in model.textures) if (!(k in tex)) tex[k] = model.textures[k];
@@ -733,6 +767,57 @@
       model = await fetchModelJson(parent);
     }
     return finishCube(tex);
+  }
+
+  // 1.21.4 item-definitions live under items/<name>.json as { model: <item-model> }.
+  function fetchItemDef(name) {
+    if (itemDefCache.has(name)) return itemDefCache.get(name);
+    const p = fetch(ITEMDEF_BASE + name + '.json').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    itemDefCache.set(name, p);
+    return p;
+  }
+  // find the FIRST nested minecraft:model node's model-path (recursing over dispatch containers).
+  // Tints are ignored entirely (potions/spawn eggs etc. -> just the base layer0 texture, no tint).
+  function findFirstModelPath(node) {
+    if (!node || typeof node !== 'object') return null;
+    if (stripNs(node.type || '') === 'model' && typeof node.model === 'string') return stripNs(node.model);
+    const kids = [];
+    if (Array.isArray(node.cases)) node.cases.forEach((c) => kids.push(c && c.model));
+    if (node.fallback) kids.push(node.fallback);
+    if (node.on_true) kids.push(node.on_true);
+    if (node.on_false) kids.push(node.on_false);
+    if (Array.isArray(node.entries)) node.entries.forEach((e) => kids.push(e && e.model));
+    if (Array.isArray(node.models)) node.models.forEach((m) => kids.push(m));
+    for (const k of kids) { const r = findFirstModelPath(k); if (r) return r; }
+    return null;
+  }
+  async function resolveViaItemDef(name) {
+    const def = await fetchItemDef(name);
+    if (!def || !def.model) return null;
+    const modelPath = findFirstModelPath(def.model);
+    return modelPath ? await walkModel(modelPath) : null;
+  }
+  // does a texture exist? (fetch, since CORS is *). used only for the final broadened probe.
+  async function probeTexture(path) {
+    try { const r = await fetch(ICON_BASE + path + '.png'); return r.ok; } catch (e) { return false; }
+  }
+
+  // classify a material -> {kind:'flat',tex} | {kind:'cube',top,side,front} | {kind:'blank'}
+  async function resolveIconModel(name) {
+    // 1) legacy item model (item/<name>.json)
+    let res = await walkModel('item/' + name);
+    if (res && res.kind !== 'blank') return res;
+    // 2) 1.21.4 item-definition -> first nested model path -> resolve that model
+    const defRes = await resolveViaItemDef(name);
+    if (defRes && defRes.kind !== 'blank') return defRes;
+    // 3) block model (many blocks have no item model)
+    res = (await walkModel('block/' + name)) || (await walkModel('block/' + name + '_inventory'));
+    if (res && res.kind !== 'blank') return res;
+    // 4) broadened texture probe before giving up to text
+    for (const p of ['item/' + name, 'block/' + name, 'item/' + name + '_00']) {
+      if (await probeTexture(p)) return { kind: 'flat', tex: p };
+    }
+    return { kind: 'blank' }; // truly texture-less entity item (chest/bed/skull/banner/shield/...)
   }
 
   // build a 3D CSS cube: top face, left = side, right = front (or side)
@@ -835,13 +920,18 @@
     if (material && String(material).trim()) holder.append(makeIconHolder(material, 28, 'mi-txt', false));
   }
 
-  // ================================================================== RAW-YAML MODE
-  function syncRawMode() {
+  // ================================================================== VIEW MODES (raw / graph)
+  // raw and graph are mutually exclusive; both replace the center+right area.
+  function syncModes() {
     const layout = $('layout');
     $('raw-toggle').setAttribute('aria-pressed', state.raw ? 'true' : 'false');
+    $('graph-toggle').setAttribute('aria-pressed', state.graph ? 'true' : 'false');
     layout.classList.toggle('raw-mode', state.raw);
+    layout.classList.toggle('graph-mode', state.graph);
     $('raw-wrap').hidden = !state.raw;
+    $('graph-wrap').hidden = !state.graph;
     if (state.raw) dumpRaw();
+    if (state.graph) renderGraph();
   }
 
   function dumpRaw() {
@@ -873,13 +963,195 @@
       renderAll();
     } else {
       if (!current()) { toast('Нет выбранного меню', 'err'); return; }
+      state.graph = false;   // mutually exclusive
       state.raw = true;
-      syncRawMode();
+      syncModes();
+    }
+  }
+
+  function toggleGraph() {
+    if (state.graph) {
+      state.graph = false;
+      renderAll();
+    } else {
+      if (state.raw) { if (!commitRaw()) { toast('Исправь YAML, затем переключись', 'err'); return; } state.raw = false; }
+      state.graph = true;
+      syncModes();
     }
   }
 
   function showRawErr(msg) { const e = $('raw-err'); e.textContent = 'YAML: ' + msg; e.hidden = false; }
   function hideRawErr() { $('raw-err').hidden = true; }
+
+  // ================================================================== NAVIGATION GRAPH
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs, text) {
+    const n = document.createElementNS(SVGNS, tag);
+    if (attrs) for (const k in attrs) n.setAttribute(k, attrs[k]);
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  // every open_menu target anywhere in a menu object (clicks, dialog buttons, conditional branches)
+  function collectOpenMenuTargets(obj) {
+    const out = [];
+    (function walk(n) {
+      if (!n || typeof n !== 'object') return;
+      if (Array.isArray(n)) { n.forEach(walk); return; }
+      if (n.type === 'open_menu' && n.menu) out.push(String(n.menu));
+      for (const k in n) walk(n[k]);
+    })(obj);
+    return out;
+  }
+  // nodes = menus (+ ghost nodes for dangling targets); edges = open_menu links (deduped)
+  function buildGraphData() {
+    const menus = state.menus;
+    const idOf = new Map();
+    menus.forEach((m, i) => idOf.set(m.id, i));
+    const nodes = menus.map((m, i) => ({ id: m.id, type: (m.obj && m.obj.type) || '?', real: true, menuIndex: i }));
+    const ghost = new Map();
+    const seen = new Set();
+    const edges = [];
+    menus.forEach((m, i) => {
+      collectOpenMenuTargets(m.obj).forEach((t) => {
+        let to;
+        if (idOf.has(t)) to = idOf.get(t);
+        else { if (!ghost.has(t)) { ghost.set(t, nodes.length); nodes.push({ id: t, type: null, real: false }); } to = ghost.get(t); }
+        const key = i + '>' + to;
+        if (!seen.has(key)) { seen.add(key); edges.push({ from: i, to }); }
+      });
+    });
+    return { nodes, edges };
+  }
+  // point on a node's box border (center cx,cy; half hw,hh) toward (tx,ty)
+  function boxTrim(cx, cy, tx, ty, hw, hh) {
+    const dx = tx - cx, dy = ty - cy;
+    if (dx === 0 && dy === 0) return { x: cx, y: cy };
+    const sx = dx !== 0 ? hw / Math.abs(dx) : Infinity;
+    const sy = dy !== 0 ? hh / Math.abs(dy) : Infinity;
+    const s = Math.min(sx, sy);
+    return { x: cx + dx * s, y: cy + dy * s };
+  }
+  function selfLoopPath(cx, cy) {
+    const y = cy - 24;
+    return 'M ' + (cx - 14) + ' ' + y + ' C ' + (cx - 44) + ' ' + (y - 48) + ', ' + (cx + 44) + ' ' + (y - 48) + ', ' + (cx + 14) + ' ' + y;
+  }
+  function graphDefs() {
+    const defs = svgEl('defs');
+    const m = svgEl('marker', { id: 'gm-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' });
+    m.append(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'context-stroke' })); // arrow follows the line color
+    defs.append(m);
+    return defs;
+  }
+  function renderGraph() {
+    const wrap = $('graph-wrap');
+    const svg = $('graph-svg');
+    const note = $('graph-empty');
+    clear(svg);
+    graphEdges = [];
+    if (!state.menus.length) { note.hidden = false; svg.style.display = 'none'; return; }
+    note.hidden = true; svg.style.display = 'block';
+
+    const data = buildGraphData();
+    graphNodes = data.nodes;
+    const rect = wrap.getBoundingClientRect();
+    const W = Math.max(320, Math.round(rect.width) || 800);
+    const H = Math.max(280, Math.round(rect.height) || 500);
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('width', W); svg.setAttribute('height', H);
+
+    // circle layout; keep any position already set (so drags persist)
+    const cx = W / 2, cy = H / 2, R = Math.max(90, Math.min(W, H) / 2 - 80);
+    const N = graphNodes.length;
+    graphNodes.forEach((node, i) => {
+      if (!graphPos[node.id]) {
+        if (N === 1) graphPos[node.id] = { x: cx, y: cy };
+        else { const a = -Math.PI / 2 + (i / N) * 2 * Math.PI; graphPos[node.id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) }; }
+      }
+    });
+
+    svg.append(graphDefs());
+    const selId = current() ? current().id : null;
+
+    // edges first (under nodes)
+    data.edges.forEach((e) => {
+      const A = graphNodes[e.from], B = graphNodes[e.to];
+      const pa = graphPos[A.id], pb = graphPos[B.id];
+      const hot = selId && (A.id === selId || B.id === selId);
+      let line;
+      if (e.from === e.to) {
+        line = svgEl('path', { d: selfLoopPath(pa.x, pa.y), class: 'gedge' + (hot ? ' hot' : ''), 'marker-end': 'url(#gm-arrow)' });
+      } else {
+        const s = boxTrim(pa.x, pa.y, pb.x, pb.y, 55, 22), t = boxTrim(pb.x, pb.y, pa.x, pa.y, 55, 22);
+        line = svgEl('line', { x1: s.x, y1: s.y, x2: t.x, y2: t.y, class: 'gedge' + (hot ? ' hot' : ''), 'marker-end': 'url(#gm-arrow)' });
+      }
+      svg.append(line);
+      graphEdges.push({ from: e.from, to: e.to, node: line });
+    });
+
+    // nodes on top
+    graphNodes.forEach((node, i) => {
+      const p = graphPos[node.id];
+      const g = svgEl('g', {
+        class: 'gnode' + (node.real ? '' : ' ghost') + (node.real && node.id === selId ? ' sel' : ''),
+        transform: 'translate(' + p.x + ',' + p.y + ')', 'data-i': i
+      });
+      g.append(svgEl('rect', { class: 'nbox', x: -55, y: -22, width: 110, height: 44, rx: 9 }));
+      g.append(svgEl('text', { class: 'nid', x: 0, y: node.real ? -2 : 4, 'text-anchor': 'middle' }, node.id));
+      g.append(svgEl('text', { class: 'ntype', x: 0, y: node.real ? 14 : 16, 'text-anchor': 'middle' }, node.real ? node.type : 'нет меню'));
+      g.addEventListener('mousedown', (ev) => onGraphNodeDown(ev, i));
+      svg.append(g);
+    });
+  }
+  function svgPoint(svg, clientX, clientY) {
+    const pt = svg.createSVGPoint(); pt.x = clientX; pt.y = clientY;
+    const m = svg.getScreenCTM();
+    if (!m) return { x: clientX, y: clientY };
+    const p = pt.matrixTransform(m.inverse());
+    return { x: p.x, y: p.y };
+  }
+  // update one node's group + the endpoints of every edge that touches it (during drag)
+  function updateGraphNode(i) {
+    const svg = $('graph-svg');
+    const node = graphNodes[i];
+    const p = graphPos[node.id];
+    const g = svg.querySelector('.gnode[data-i="' + i + '"]');
+    if (g) g.setAttribute('transform', 'translate(' + p.x + ',' + p.y + ')');
+    graphEdges.forEach((e) => {
+      if (e.from !== i && e.to !== i) return;
+      const pa = graphPos[graphNodes[e.from].id], pb = graphPos[graphNodes[e.to].id];
+      if (e.from === e.to) { e.node.setAttribute('d', selfLoopPath(pa.x, pa.y)); return; }
+      const s = boxTrim(pa.x, pa.y, pb.x, pb.y, 55, 22), t = boxTrim(pb.x, pb.y, pa.x, pa.y, 55, 22);
+      e.node.setAttribute('x1', s.x); e.node.setAttribute('y1', s.y);
+      e.node.setAttribute('x2', t.x); e.node.setAttribute('y2', t.y);
+    });
+  }
+  function onGraphNodeDown(ev, i) {
+    ev.preventDefault();
+    const node = graphNodes[i];
+    const svg = $('graph-svg');
+    let moved = false;
+    const move = (e) => {
+      moved = true;
+      const pt = svgPoint(svg, e.clientX, e.clientY);
+      graphPos[node.id] = { x: pt.x, y: pt.y };
+      updateGraphNode(i);
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      if (!moved && node.real) selectMenuFromGraph(node.menuIndex); // click (no drag) selects the menu
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  }
+  // clicking a node selects that menu but stays in the graph view (re-highlights)
+  function selectMenuFromGraph(i) {
+    state.sel = i;
+    resetSelection();
+    renderSidebar();
+    $('cur-menu-id').textContent = state.menus[i] ? state.menus[i].id : '—';
+    renderGraph();
+  }
 
   // ================================================================== MENU CRUD
   function openNewMenu() {
@@ -1072,6 +1344,7 @@
   function wireStaticUi() {
     $('save-btn').onclick = saveBundle;
     $('raw-toggle').onclick = toggleRaw;
+    $('graph-toggle').onclick = toggleGraph;
     $('raw-yaml').addEventListener('blur', commitRaw);
 
     $('new-menu-btn').onclick = openNewMenu;
