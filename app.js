@@ -994,8 +994,11 @@
   // every open_menu target anywhere in a menu object (clicks, dialog buttons, conditional branches)
   function collectOpenMenuTargets(obj) {
     const out = [];
+    const seen = new WeakSet(); // guard against cyclic YAML anchors (js-yaml aliases share references)
     (function walk(n) {
       if (!n || typeof n !== 'object') return;
+      if (seen.has(n)) return;
+      seen.add(n);
       if (Array.isArray(n)) { n.forEach(walk); return; }
       if (n.type === 'open_menu' && n.menu) out.push(String(n.menu));
       for (const k in n) walk(n[k]);
@@ -1129,8 +1132,11 @@
     ev.preventDefault();
     const node = graphNodes[i];
     const svg = $('graph-svg');
+    const start = { x: ev.clientX, y: ev.clientY };
     let moved = false;
     const move = (e) => {
+      // 4px dead-zone: a deliberate click often emits 1-2px of jitter — don't misread it as a drag.
+      if (!moved && Math.hypot(e.clientX - start.x, e.clientY - start.y) < 4) return;
       moved = true;
       const pt = svgPoint(svg, e.clientX, e.clientY);
       graphPos[node.id] = { x: pt.x, y: pt.y };
