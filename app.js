@@ -71,6 +71,19 @@
     ['close', 'Закрыть'], ['back', 'Назад'], ['conditional', 'Условие (JSON)']
   ];
 
+  // requirement types the STRUCTURED builder understands; composites (all/any/not) and anything
+  // else are edited via the per-requirement «Расширенно (raw)» YAML box. (See REQUIREMENTS.)
+  const REQ_TYPES = [
+    ['', '— нет —'],
+    ['permission', 'Право (permission)'],
+    ['placeholder', 'Плейсхолдер (placeholder)'],
+    ['money', 'Деньги (money)'],
+    ['has_item', 'Предмет (has_item)'],
+    ['exp', 'Опыт (exp)']
+  ];
+  const REQ_STRUCTURED = ['permission', 'placeholder', 'money', 'has_item', 'exp'];
+  const PLACEHOLDER_OPS = ['==', '!=', 'contains', 'contains_ignorecase', 'equals_ignorecase', 'regex', '>', '<', '>=', '<='];
+
   // ------------------------------------------------------------------ state
   const state = {
     workerBase: '',        // Worker base URL (from hash `w=`, or saved in localStorage)
@@ -319,6 +332,11 @@
     const help = $('ms-show-help');
     help.checked = m.obj['show-in-help'] !== false;
     help.onchange = () => { if (help.checked) delete m.obj['show-in-help']; else m.obj['show-in-help'] = false; };
+
+    // open-requirement (block: require + deny/success actions) — top-level menu key
+    buildReqBlock($('req-open'),
+      () => (m.obj['open-requirement'] != null ? m.obj['open-requirement'] : null),
+      (block) => { if (block == null) delete m.obj['open-requirement']; else m.obj['open-requirement'] = block; });
   }
 
   // chest = rows*9 cells; inventory = 27; other types -> note (edit via raw YAML)
@@ -490,6 +508,7 @@
 
     renderFlags(disp);
     renderClicks(disp);
+    renderSlotRequirements(disp);   // view-requirement + click-requirement builders (bulk-aware)
   }
 
   function renderFlags(disp) {
@@ -740,6 +759,300 @@
     });
   }
   function propagateClicksIfBulk() { if (targetSlots().length > 1) propagateClicks(); }
+
+  // ================================================================== REQUIREMENTS
+  // view/click (per item) + open (per menu). A *requirement* = { type, ...fields, negate? }; the
+  // structured builder covers permission/placeholder/money/has_item/exp, and a per-requirement raw
+  // YAML box edits anything (incl. all/any/not composites). `view-requirement` = a bare requirement;
+  // `click-requirement`/`open-requirement` = a BLOCK { require, deny:[actions], success?:[actions] }.
+  // These round-trip straight into the obj keys the plugin parses (jsyaml.dump handles the rest).
+
+  const isStructuredReq = (t) => REQ_STRUCTURED.indexOf(t) !== -1;
+  const numOr = (v, d) => { const n = Number(v); return (isFinite(n) && String(v).trim() !== '') ? n : d; };
+
+  // Write (or delete) a requirement key on every TARGET slot that ALREADY holds an item — the active
+  // slot plus any others in the selection (bulk), deep-cloned. Empty slots are skipped on BOTH the
+  // set and clear paths: requirements constrain existing items and must never materialise a STONE
+  // placeholder. (Plain-clicking a cell already creates its item, so the active slot is normally set.)
+  function writeReqKey(key, value) {
+    const m = current();
+    if (!m || !m.obj.items) return;
+    targetSlots().forEach((s) => {
+      const it = m.obj.items[String(s)];
+      if (!it) return;                                  // never create an item just to hold a requirement
+      if (value == null) delete it[key];
+      else it[key] = JSON.parse(JSON.stringify(value));
+    });
+  }
+
+  // Renders a single-requirement builder into `host`. `initial` = existing requirement (or null).
+  // `onChange(value)` fires on every user edit with the requirement object, or null when cleared.
+  // Populating (the initial render) does NOT emit — round-trip only writes back on real edits.
+  function buildRequirementBuilder(host, initial, onChange) {
+    clear(host);
+    host.classList.add('req-builder');
+    const structured = !initial || isStructuredReq(initial.type);
+    const local = { raw: !structured };   // composites/unknown types open straight in the raw box
+    let refs = {};
+
+    // controls row: type <select> + «Расширенно (raw)» toggle
+    const ctrls = el('div', 'req-ctrls');
+    const typeSel = el('select', 'in');
+    REQ_TYPES.forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; typeSel.append(o); });
+    typeSel.value = (initial && isStructuredReq(initial.type)) ? initial.type : '';
+    const rawBtn = el('button', 'btn small req-raw-toggle', 'Расширенно');
+    rawBtn.type = 'button';
+    ctrls.append(typeSel, rawBtn);
+
+    const fieldsBox = el('div', 'req-fields');
+    const negLab = el('label', 'check req-negate');
+    const negCb = document.createElement('input'); negCb.type = 'checkbox';
+    negCb.checked = !!(initial && initial.negate);
+    negLab.append(negCb, el('span', null, 'Инвертировать (negate)'));
+
+    const rawBox = el('div', 'req-raw');
+    const rawTa = document.createElement('textarea');
+    rawTa.className = 'in area'; rawTa.spellcheck = false; rawTa.rows = 4;
+    rawTa.placeholder = 'type: any\nof:\n  - { type: permission, permission: a.b }\n  - { type: money, amount: 100 }';
+    if (initial && !structured) rawTa.value = jsyaml.dump(initial, { lineWidth: -1, noRefs: true, indent: 2 }).trim();
+    const rawErr = el('div', 'req-raw-err'); rawErr.hidden = true;
+    rawBox.append(rawTa, rawErr);
+
+    host.append(ctrls, fieldsBox, negLab, rawBox);
+
+    // gather the structured value from the current inputs (null when no type is chosen)
+    function collectStructured() {
+      const type = typeSel.value;
+      if (!type) return null;
+      const req = { type };
+      if (type === 'permission') req.permission = refs.permission.value;
+      else if (type === 'placeholder') { req.placeholder = refs.placeholder.value; req.operator = refs.operator.value; req.value = refs.value.value; }
+      else if (type === 'money') req.amount = numOr(refs.amount.value, 0);
+      else if (type === 'has_item') { req.material = refs.material.value; req.amount = numOr(refs.amount.value, 1); }
+      else if (type === 'exp') { req.amount = numOr(refs.amount.value, 0); req.level = refs.level.checked; }
+      if (negCb.checked) req.negate = true;
+      return req;
+    }
+
+    function emit() {
+      if (local.raw) {
+        const txt = rawTa.value.trim();
+        if (txt === '') { rawErr.hidden = true; rawTa.style.borderColor = ''; onChange(null); return; }
+        try {
+          const parsed = jsyaml.load(txt);
+          if (!parsed || typeof parsed !== 'object') throw new Error('ожидается объект');
+          rawErr.hidden = true; rawTa.style.borderColor = '';
+          onChange(parsed);
+        } catch (e) {
+          rawErr.textContent = 'YAML: ' + (e && e.message ? e.message : 'ошибка');
+          rawErr.hidden = false; rawTa.style.borderColor = 'var(--danger)';
+          // invalid raw -> leave the obj untouched until it parses again
+        }
+        return;
+      }
+      onChange(collectStructured());
+    }
+
+    // one field registered in `refs` and wired to emit; `kind` = text | number | select | check
+    function addField(key, label, kind, opts) {
+      opts = opts || {};
+      if (kind === 'check') {
+        const lab = el('label', 'check');
+        const inp = document.createElement('input'); inp.type = 'checkbox'; inp.checked = !!opts.value;
+        inp.onchange = emit;
+        lab.append(inp, el('span', null, label));
+        refs[key] = inp; fieldsBox.append(lab); return;
+      }
+      let inp;
+      if (kind === 'select') {
+        inp = el('select', 'in');
+        (opts.options || []).forEach((v) => { const o = document.createElement('option'); o.value = v; o.textContent = v; inp.append(o); });
+        inp.value = opts.value != null ? opts.value : '';
+        inp.onchange = emit;
+      } else {
+        inp = document.createElement('input');
+        inp.type = kind === 'number' ? 'number' : 'text'; inp.className = 'in';
+        if (kind === 'number') inp.step = 'any';
+        inp.value = opts.value != null ? String(opts.value) : '';
+        if (opts.placeholder) inp.placeholder = opts.placeholder;
+        inp.oninput = emit;
+      }
+      refs[key] = inp;
+      fieldsBox.append(labelWrap(label, inp));
+    }
+
+    function renderFields() {
+      clear(fieldsBox);
+      refs = {};
+      const type = typeSel.value;
+      const src = (initial && initial.type === type) ? initial : {};  // seed from initial only on a match
+      if (type === 'permission') {
+        addField('permission', 'Право (node)', 'text', { value: src.permission, placeholder: 'напр. menus.shop' });
+      } else if (type === 'placeholder') {
+        addField('placeholder', 'Плейсхолдер', 'text', { value: src.placeholder, placeholder: '%player_name%' });
+        addField('operator', 'Оператор', 'select', { value: src.operator || '==', options: PLACEHOLDER_OPS });
+        addField('value', 'Значение', 'text', { value: src.value, placeholder: 'сравнить с…' });
+      } else if (type === 'money') {
+        addField('amount', 'Сумма', 'number', { value: src.amount != null ? src.amount : '' });
+      } else if (type === 'has_item') {
+        addField('material', 'Материал', 'text', { value: src.material, placeholder: 'DIAMOND' });
+        addField('amount', 'Кол-во', 'number', { value: src.amount != null ? src.amount : 1 });
+      } else if (type === 'exp') {
+        addField('amount', 'Кол-во', 'number', { value: src.amount != null ? src.amount : '' });
+        addField('level', 'В уровнях (level)', 'check', { value: src.level === true });
+      }
+    }
+
+    function syncMode() {
+      rawBtn.setAttribute('aria-pressed', local.raw ? 'true' : 'false');
+      typeSel.disabled = local.raw;
+      fieldsBox.hidden = local.raw;
+      negLab.hidden = local.raw || !typeSel.value;
+      rawBox.hidden = !local.raw;
+    }
+
+    // Toggling modes only swaps which editor is shown — it must SYNC the value across, never emit.
+    // (The obj is already current from per-keystroke emits, so a toggle must not rewrite/delete it.)
+    rawBtn.onclick = () => {
+      if (!local.raw) {
+        // structured -> raw: carry the CURRENT structured value into the box verbatim (overwrite)
+        const cur = collectStructured();
+        rawTa.value = cur ? jsyaml.dump(cur, { lineWidth: -1, noRefs: true, indent: 2 }).trim() : '';
+        rawErr.hidden = true; rawTa.style.borderColor = '';
+        local.raw = true;
+        syncMode();
+        return;
+      }
+      // raw -> structured: only switch when the YAML is a representable STRUCTURED requirement;
+      // for composites (all/any/not/unknown) or invalid YAML, STAY in raw — never null the value.
+      const txt = rawTa.value.trim();
+      if (txt !== '') {
+        let parsed;
+        try { parsed = jsyaml.load(txt); }
+        catch (e) { toast('Исправьте YAML, затем переключитесь в простой режим', 'err'); return; }
+        if (!parsed || typeof parsed !== 'object' || !isStructuredReq(parsed.type)) {
+          toast('Композит/сложное условие — редактируется только в raw', 'err');
+          return;   // keep raw mode; the requirement is left exactly as-is
+        }
+        initial = parsed;                 // reseed the structured inputs from the (edited) raw value
+      } else {
+        initial = null;                   // empty box -> empty structured (obj already reflects this)
+      }
+      typeSel.value = (initial && isStructuredReq(initial.type)) ? initial.type : '';
+      negCb.checked = !!(initial && initial.negate);
+      renderFields();
+      rawErr.hidden = true; rawTa.style.borderColor = '';
+      local.raw = false;
+      syncMode();
+    };
+    typeSel.onchange = () => { renderFields(); syncMode(); emit(); };
+    negCb.onchange = emit;
+    rawTa.oninput = emit;
+
+    renderFields();
+    syncMode();
+  }
+
+  // generic action-list editor (deny/success). `actions` is a live array mutated in place; `onChange`
+  // fires after structural edits, and per-field typing bubbles to a delegated listener on the host.
+  function renderActionList(host, actions, onChange) {
+    clear(host);
+    actions.forEach((a, idx) => host.append(buildGenericActionRow(host, actions, idx, onChange)));
+    const add = el('button', 'btn small add-action', '＋ действие');
+    add.type = 'button';
+    add.onclick = () => { actions.push({ type: 'message', text: '' }); onChange(); renderActionList(host, actions, onChange); };
+    host.append(add);
+  }
+  function buildGenericActionRow(host, actions, idx, onChange) {
+    const a = actions[idx];
+    const row = el('div', 'action-row');
+    const top = el('div', 'action-top');
+    const sel = el('select', 'in');
+    ACTION_TYPES.forEach(([val, lab]) => { const o = document.createElement('option'); o.value = val; o.textContent = lab; sel.append(o); });
+    sel.value = a.type || 'message';
+    sel.onchange = () => { actions[idx] = defaultAction(sel.value); onChange(); renderActionList(host, actions, onChange); };
+    const del = el('button', 'btn icon', '×'); del.type = 'button'; del.title = 'Удалить действие';
+    del.onclick = () => { actions.splice(idx, 1); onChange(); renderActionList(host, actions, onChange); };
+    top.append(sel, del);
+    row.append(top);
+    const fields = el('div', 'action-fields');
+    buildActionFields(fields, a);   // reuses the clicks field editor; mutates `a` in place
+    row.append(fields);
+    return row;
+  }
+
+  // block editor: require (single-requirement builder) + deny + optional success action lists.
+  // `getBlock()`/`setBlock(block|null)` abstract storage + bulk (item click-req vs menu open-req).
+  function buildReqBlock(host, getBlock, setBlock) {
+    clear(host);
+    const b = getBlock() || {};
+    // Derive the condition: an explicit `require:` wins; otherwise a hand-authored BARE block (no
+    // require/deny/success wrapper — the whole map IS the condition, which the plugin also accepts)
+    // is preserved so the first edit doesn't silently drop the gate. commit() re-normalises it.
+    let cond = null;
+    if (b && b.require !== undefined) {
+      cond = b.require;
+    } else if (b && typeof b === 'object') {
+      const leftover = {};
+      Object.keys(b).forEach((k) => { if (k !== 'require' && k !== 'deny' && k !== 'success') leftover[k] = b[k]; });
+      if (Object.keys(leftover).length) cond = leftover;
+    }
+    const work = {
+      require: (cond != null) ? JSON.parse(JSON.stringify(cond)) : null,
+      deny: (b && Array.isArray(b.deny)) ? JSON.parse(JSON.stringify(b.deny)) : [],
+      success: (b && Array.isArray(b.success)) ? JSON.parse(JSON.stringify(b.success)) : []
+    };
+    // re-serialise the working copies into a block (or delete when fully empty)
+    function commit() {
+      const block = {};
+      if (work.require != null) block.require = work.require;
+      if (work.deny.length) block.deny = work.deny;
+      if (work.success.length) block.success = work.success;   // omitted unless the user set it
+      setBlock(Object.keys(block).length ? block : null);
+    }
+
+    host.append(el('span', 'req-sub-lbl', 'Условие (require)'));
+    const reqHost = el('div');
+    host.append(reqHost);
+    buildRequirementBuilder(reqHost, work.require, (val) => { work.require = val; commit(); });
+
+    host.append(el('span', 'req-sub-lbl', 'При отказе (deny)'));
+    const denyHost = el('div', 'req-actions');
+    denyHost.addEventListener('input', commit);   // field typing -> re-serialise
+    denyHost.addEventListener('change', commit);
+    host.append(denyHost);
+    renderActionList(denyHost, work.deny, commit);
+
+    // success is tucked into a <details> so it stays out of the way until wanted
+    const succWrap = document.createElement('details');
+    succWrap.className = 'req-success';
+    const succSum = document.createElement('summary');
+    succSum.textContent = 'При успехе (success)';
+    if (work.success.length) succWrap.open = true;
+    succWrap.append(succSum);
+    const succHost = el('div', 'req-actions');
+    succHost.addEventListener('input', commit);
+    succHost.addEventListener('change', commit);
+    succWrap.append(succHost);
+    host.append(succWrap);
+    renderActionList(succHost, work.success, commit);
+  }
+
+  // single (bare) requirement editor — used for view-requirement
+  function buildReqSingle(host, getReq, setReq) {
+    const cur = getReq();
+    buildRequirementBuilder(host, cur ? JSON.parse(JSON.stringify(cur)) : null, setReq);
+  }
+
+  // wire the per-slot view/click requirement builders from the active item (bulk-aware writes)
+  function renderSlotRequirements(disp) {
+    buildReqSingle($('req-view'),
+      () => (disp && disp['view-requirement']) || null,
+      (req) => writeReqKey('view-requirement', req));
+    buildReqBlock($('req-click'),
+      () => (disp && disp['click-requirement']) || null,
+      (block) => writeReqKey('click-requirement', block));
+  }
 
   // ================================================================== ICONS (model-JSON aware)
   // In MC 1.21.11 models/item/<block>.json 404s for block-items, so a naive item/block texture

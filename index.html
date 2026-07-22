@@ -86,6 +86,10 @@
             <input type="checkbox" id="ms-show-help" checked />
             <span>Показывать в /help (show-in-help)</span>
           </label>
+          <div class="field ms-wide req-section">
+            <span class="lbl">Требование открытия (open-requirement)</span>
+            <div class="req-block" id="req-open"></div>
+          </div>
         </div>
       </details>
 
@@ -159,6 +163,19 @@
             <span class="lbl">Действия по кликам (clicks)</span>
           </div>
           <div class="clicks" id="f-clicks"></div>
+        </div>
+
+        <!-- Requirements: view (bare requirement) + click (block with deny/success actions) -->
+        <div class="field req-section">
+          <span class="lbl">Требования</span>
+          <div class="req-group">
+            <span class="req-group-lbl">Показ (view-requirement)</span>
+            <div id="req-view"></div>
+          </div>
+          <div class="req-group">
+            <span class="req-group-lbl">Клик (click-requirement)</span>
+            <div class="req-block" id="req-click"></div>
+          </div>
         </div>
       </div>
     </aside>
