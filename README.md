@@ -1,40 +1,71 @@
 # AlexMenus
 
-Лёгкий движок **меню** для **Paper 1.21.11** — сундук-GUI и меню-в-инвентаре, действия, триггеры, и
-**хостед веб-редактор в стиле LuckPerms** (на сервере порты открывать **не надо**).
+Лёгкий движок **меню** для **Paper 1.21.11** (Java 21) — сундук-GUI и меню-в-инвентаре, действия, триггеры,
+**requirements-движок** и **хостед веб-редактор в стиле LuckPerms** (на сервере порты открывать **не надо**).
 
-> Этот репозиторий = **хостед-редактор** (GitHub Pages, страница `index.html`) **+** дистрибутив плагина
+> Этот репозиторий = **хостед-редактор** (GitHub Pages, `index.html`) **+** дистрибутив плагина
 > (jar в [Releases](../../releases)) **+** код paste-сервиса (`cloudflare-worker/`).
 
 ## Скачать
 Плагин: **[Releases](../../releases)** → `AlexMenus-<версия>.jar` → положи в `plugins/`.
 
+## Скриншоты
+> Скриншоты интерфейса добавляются. Пока проще всего посмотреть редактор **вживую**: запусти `/am editor`
+> на сервере и открой ссылку (или подставь свой paste-код к адресу редактора).
+
+<!-- screenshots: docs/editor.png, docs/requirements.png, docs/graph.png -->
+
 ## Возможности
 - Меню **`type: chest`** (GUI-сундук) и **`type: inventory`** (меню в инвентаре игрока).
-- Действия: `run_command / open_menu / give_item / message / sound / conditional / …`.
 - **Цвета** в `title`/`name`/`lore`: легаси `&c&l`, hex `&#ff8800`, Bungee `&x&f&f…` **и** MiniMessage — вперемешку.
 - **Команды меню** (`commands: [shop]`) как настоящие команды (tab-комплит, `/help`, `command-description`, `show-in-help`).
 - **Права** меню: `permission:` — на всех путях открытия.
-- **`/am reload`** перезагружает плагин целиком (конфиг + меню + команды + триггеры + редактор).
-- **Редактор:** мультивыделение слотов, контекстное меню (ПКМ), 3D-иконки блоков, **граф** навигации, панель «Настройки меню».
+- **Requirements-движок** (view/click/open) — см. ниже.
+- **Действия** вкл. экономику Vault (`give_money`/`take_money`), опыт, `broadcast`, `sound`, и модификаторы `chance`/`delay`.
+- **`/am reload`** перезагружает плагин целиком.
+- **Редактор:** мультивыделение слотов, контекстное меню (ПКМ), 3D-иконки блоков, **панель requirements**,
+  **граф** навигации, панель «Настройки меню».
+
+## Requirements-движок
+Три места для условий:
+- **`view-requirement`** на предмете — предмет **виден** только при условии;
+- **`click-requirement`** на предмете — **гейт клика** с `deny`/`success`;
+- **`open-requirement`** на меню — **гейт открытия** с `deny`.
+
+Краткая форма (весь блок = условие) и полная (`require:` + `deny:`/`success:`):
+```yaml
+view-requirement: { type: permission, permission: alexmenus.vip }
+
+click-requirement:
+  require: { type: money, amount: 100 }
+  deny:
+    - type: message
+      text: "<red>Недостаточно денег"
+```
+Типы: `permission`, `placeholder` (`== != contains regex > < >= <=` и др.), `money` (Vault), `has_item`,
+`exp` (очки/уровни), композиты `all`/`any`/`not`, флаг `negate`. В редакторе всё это — визуальными билдерами.
+
+## Действия
+`run_command` · `message` · `broadcast` · `open_menu` · `refresh` · `back` · `close` · `sound` · `give_item` ·
+`give_money`/`take_money` (Vault) · `give_exp`/`take_exp` · `conditional`. На любом действии — `chance: 0–100`
+и `delay: <тики>`.
 
 ## Настройка (один раз, ~10 мин)
-1. **Paste-сервис (Cloudflare Worker, бесплатно):** разверни воркер из папки [`cloudflare-worker/`](cloudflare-worker/)
-   (пошаговая инструкция там, есть вариант без CLI). Скопируй его адрес.
+1. **Paste-сервис (Cloudflare Worker, бесплатно):** разверни воркер из [`cloudflare-worker/`](cloudflare-worker/).
 2. **`plugins/AlexMenus/config.yml`:**
    ```yaml
    editor:
-     worker-url: "https://alexmenus-paste.<твой-акк>.workers.dev"   # адрес ТВОЕГО воркера
-     url: "https://<твой-акк>.github.io/alexmenus-editor/"          # хостед-редактор (эта страница)
+     worker-url: "https://alexmenus-paste.<твой-акк>.workers.dev"
+     url: "https://<твой-акк>.github.io/alexmenus-editor/"
    ```
-3. `/reload` в игре.
+3. `/reload`.
 
 ## Как пользоваться
 ```
-/am editor        → ссылка вида  <editor>/#<код>   (правишь меню в браузере, «Сохранить» даёт новый код)
-/am apply <код>   → плагин скачивает правки и записывает menus/*.yml + reload
+/am editor        → ссылка <editor>#<код>   (правишь меню в браузере, «Сохранить» даёт новый код)
+/am apply <код>   → плагин скачивает правки → menus/*.yml + reload
 ```
-Плагин делает только **исходящие** HTTPS-запросы к воркеру — на игровом сервере порты не открываются.
+Плагин делает только **исходящие** HTTPS-запросы к воркеру — порты на игровом сервере не открываются.
 Правки применяет **админ командой**, а не «у кого ссылка — тот рулит».
 
 ## Команды и права
@@ -42,9 +73,9 @@
 Права: `alexmenus.use`, `alexmenus.admin`, и `permission` конкретного меню.
 
 ## Сборка из исходников
-Требования: Paper 1.21.11, Java 21. Сборка Maven Wrapper: `./mvnw.cmd clean package` (шейдится InvUI).
-PlaceholderAPI — мягкая зависимость.
+Paper 1.21.11, Java 21, Maven Wrapper: `./mvnw.cmd clean package` (шейдится InvUI).
+**PlaceholderAPI** и **Vault** — мягкие зависимости.
 
 ## Свой редактор
-SPA — это `index.html` / `style.css` / `app.js` в корне. Хостится на GitHub Pages. Хочешь свой —
-форкни, при необходимости поправь адрес воркера и укажи свой `editor.url` в конфиге плагина.
+SPA — это `index.html` / `style.css` / `app.js` в корне (хостится на GitHub Pages). Хочешь свой — форкни и
+укажи свой `editor.url` в конфиге плагина. Адрес воркера редактор спрашивает один раз и запоминает (в браузере).
