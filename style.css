@@ -14,6 +14,12 @@
   --topbar-h:48px;
   --sidebar-w:240px;
   --props-w:320px;
+
+  /* chest/inventory slot grid sizing (was 46px cell / 5px gap; ~1.5x bigger so it's comfortable at
+     100% browser zoom instead of needing 160%). The grid is always 9 wide; the grid-wrap scrolls if a
+     very large menu exceeds the center column, so this never forces horizontal PAGE scroll. */
+  --cell:70px;
+  --cell-gap:6px;
 }
 
 * { box-sizing:border-box; }
@@ -148,15 +154,20 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
   grid-template-columns:var(--sidebar-w) 1fr var(--props-w);
 }
 .layout.raw-mode .props,
-.layout.graph-mode .props { display:none; }
+.layout.graph-mode .props,
+.layout.reqedit-mode .props { display:none; }
 .layout.raw-mode .center,
-.layout.graph-mode .center { grid-column:2 / 4; }
+.layout.graph-mode .center,
+.layout.reqedit-mode .center { grid-column:2 / 4; }
 .layout.raw-mode .center-toolbar,
 .layout.raw-mode .menu-settings,
 .layout.raw-mode .grid-wrap,
 .layout.graph-mode .center-toolbar,
 .layout.graph-mode .menu-settings,
-.layout.graph-mode .grid-wrap { display:none; }
+.layout.graph-mode .grid-wrap,
+.layout.reqedit-mode .center-toolbar,
+.layout.reqedit-mode .menu-settings,
+.layout.reqedit-mode .grid-wrap { display:none; }
 
 /* ============ sidebar ============ */
 .sidebar {
@@ -201,13 +212,13 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 
 .grid-wrap { flex:1 1 auto; overflow:auto; padding:22px; display:flex; flex-direction:column; align-items:center; }
 .slot-grid {
-  display:grid; grid-template-columns:repeat(9, 46px); gap:5px;
+  display:grid; grid-template-columns:repeat(9, var(--cell)); gap:var(--cell-gap);
   justify-content:center; padding:14px;
   background:var(--panel); border:1px solid var(--border); border-radius:var(--r);
   user-select:none; -webkit-user-select:none; /* keep drag-select from selecting text */
 }
 .cell {
-  width:46px; height:46px; border-radius:var(--r-xs);
+  width:var(--cell); height:var(--cell); border-radius:var(--r-xs);
   background:var(--panel-2); border:1px solid var(--border);
   display:flex; align-items:center; justify-content:center;
   cursor:pointer; position:relative; overflow:hidden;
@@ -222,12 +233,12 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
   box-shadow:inset 0 0 0 2px var(--accent), 0 0 0 2px var(--accent-soft);
 }
 .cell .cell-num {
-  position:absolute; top:2px; left:4px; font-size:9px;
+  position:absolute; top:3px; left:5px; font-size:10px;
   color:var(--faint); font-family:var(--mono); pointer-events:none;
 }
 .cell .cell-txt {
-  font-size:9px; color:var(--muted); text-align:center; padding:0 2px;
-  word-break:break-word; line-height:1.1;
+  font-size:10px; color:var(--muted); text-align:center; padding:0 2px;
+  word-break:break-word; line-height:1.15;
 }
 
 /* ---- item icons: flat <img> or a 3D CSS cube for blocks (texture-only, theme-agnostic) ---- */
@@ -416,10 +427,13 @@ select.in { appearance:none;
 
 /* ============ requirement node-graph editor («🔗 Граф») ============ */
 .req-editor { display:flex; flex-direction:column; gap:8px; }
-.req-mode-bar { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.req-mode-lbl { font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:.4px; }
+.req-mode-bar { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+.req-mode-lbl { flex:1 1 auto; min-width:0; font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:.4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.req-mode-btns { display:flex; align-items:center; gap:6px; flex:0 0 auto; }
 .req-graph-toggle { flex:0 0 auto; color:var(--muted); }
 .req-graph-toggle[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
+.req-full-toggle { flex:0 0 auto; color:var(--muted); }
+.req-full-toggle:hover { color:var(--accent); }
 
 .rg-host { display:flex; flex-direction:column; gap:8px; }
 .rg-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
@@ -462,6 +476,38 @@ select.in { appearance:none;
 .rg-ins-row .btn.small { padding:4px 9px; }
 .rg-ins-lbl { flex:0 0 auto; font-size:11px; color:var(--faint); }
 .rg-ins-hint { font-size:11px; color:var(--faint); line-height:1.35; }
+
+/* ============ full-screen requirement editor («⛶ На весь экран») ============ */
+/* Takes over the center area like .graph-wrap / .raw-wrap (see .layout.reqedit-mode rules above). */
+.reqedit-wrap {
+  flex:1 1 auto; min-height:0;
+  display:flex; flex-direction:column; gap:12px;
+  padding:16px 18px;
+}
+.reqedit-head { display:flex; align-items:center; gap:14px; flex:0 0 auto; }
+.reqedit-back { flex:0 0 auto; }
+.reqedit-titles { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.reqedit-title { font-weight:600; font-size:15px; }
+.reqedit-sub {
+  font-size:12px; color:var(--muted); font-family:var(--mono);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.reqedit-tabs { display:flex; gap:8px; flex:0 0 auto; flex-wrap:wrap; }
+.reqedit-tab { color:var(--muted); }
+.reqedit-tab.active { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
+
+.reqedit-body { flex:1 1 auto; min-height:0; overflow:auto; }
+/* keep a readable line length for the structured + raw tabs in the wide area (the builder adds its
+   class directly to the body host, so these are compound selectors on the body, not child combinators) */
+.reqedit-body.req-builder,
+.reqedit-body.reqedit-raw { max-width:660px; }
+.reqedit-raw { display:flex; flex-direction:column; gap:8px; }
+.reqedit-raw-area { flex:1 1 auto; min-height:320px; resize:vertical; }
+
+/* graph tab: fill the whole area and give the canvas real room (vs the cramped 320px inline canvas).
+   The graph builder adds .rg-host to the body host, so the body itself becomes the flex column. */
+.reqedit-body.reqedit-body-graph { overflow:hidden; display:flex; flex-direction:column; }
+.reqedit-body-graph .rg-canvas { flex:1 1 auto; max-height:none; min-height:340px; }
 
 /* ============ empty / loading ============ */
 .empty-state, .loading {
@@ -596,7 +642,9 @@ select.in { appearance:none;
   .layout { grid-template-columns:1fr; grid-auto-rows:min-content; }
   .sidebar { border-right:none; border-bottom:1px solid var(--border); max-height:32vh; }
   .props { border-left:none; border-top:1px solid var(--border); }
-  .layout.raw-mode .center { grid-column:1; }
+  .layout.raw-mode .center,
+  .layout.graph-mode .center,
+  .layout.reqedit-mode .center { grid-column:1; }
   .topbar { flex-wrap:wrap; height:auto; padding:8px 12px; gap:8px; }
   .cur-menu { max-width:120px; }
 }

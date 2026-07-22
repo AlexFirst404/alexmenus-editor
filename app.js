@@ -108,7 +108,9 @@
     active: null,          // the slot shown in the right panel (int) or null
     clipboard: null,       // internal copy buffer (a cloned element object)
     raw: false,            // raw-YAML mode active?
-    graph: false           // navigation-graph view active?
+    graph: false,          // navigation-graph view active?
+    reqEdit: false,        // full-screen requirement editor active?
+    reqEditCtx: null       // { title, subtitle, value, onChange } for the full-screen requirement editor
   };
 
   // transient drag-select bookkeeping
@@ -129,7 +131,9 @@
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   const current = () => (state.sel >= 0 ? state.menus[state.sel] : null);
-  function resetSelection() { state.selected = new Set(); state.active = null; }
+  // Clearing the selection also leaves the full-screen requirement editor: its onChange closures are
+  // bound to the previous menu/slot context, so switching menu (which resetSelection()s) must exit it.
+  function resetSelection() { state.selected = new Set(); state.active = null; state.reqEdit = false; state.reqEditCtx = null; }
 
   // ================================================================== INIT
   async function init() {
@@ -350,7 +354,8 @@
     // open-requirement (block: require + deny/success actions) — top-level menu key
     buildReqBlock($('req-open'),
       () => (m.obj['open-requirement'] != null ? m.obj['open-requirement'] : null),
-      (block) => { if (block == null) delete m.obj['open-requirement']; else m.obj['open-requirement'] = block; });
+      (block) => { if (block == null) delete m.obj['open-requirement']; else m.obj['open-requirement'] = block; },
+      { title: 'Условие открытия меню (open-requirement)', scope: 'menu' });
   }
 
   // chest = rows*9 cells; inventory = 27; other types -> note (edit via raw YAML)
@@ -385,7 +390,7 @@
     cell.append(el('span', 'cell-num', String(slot)));
     if (item) {
       cell.classList.add('filled');
-      cell.append(makeIconHolder(item.material, 40, 'cell-txt', true));
+      cell.append(makeIconHolder(item.material, 58, 'cell-txt', true));
     }
     if (state.selected.has(slot)) cell.classList.add('selected');
     if (state.active === slot) cell.classList.add('active');
@@ -1040,7 +1045,7 @@
 
   // block editor: require (single-requirement builder) + deny + optional success action lists.
   // `getBlock()`/`setBlock(block|null)` abstract storage + bulk (item click-req vs menu open-req).
-  function buildReqBlock(host, getBlock, setBlock) {
+  function buildReqBlock(host, getBlock, setBlock, opts) {
     clear(host);
     const b = getBlock() || {};
     // Derive the condition: an explicit `require:` wins; otherwise a hand-authored BARE block (no
@@ -1071,7 +1076,7 @@
     host.append(el('span', 'req-sub-lbl', 'Условие (require)'));
     const reqHost = el('div');
     host.append(reqHost);
-    mountRequirementEditor(reqHost, work.require, (val) => { work.require = val; commit(); });
+    mountRequirementEditor(reqHost, work.require, (val) => { work.require = val; commit(); }, opts);
 
     host.append(el('span', 'req-sub-lbl', 'При отказе (deny)'));
     const denyHost = el('div', 'req-actions');
@@ -1096,9 +1101,9 @@
   }
 
   // single (bare) requirement editor — used for view-requirement
-  function buildReqSingle(host, getReq, setReq) {
+  function buildReqSingle(host, getReq, setReq, opts) {
     const cur = getReq();
-    mountRequirementEditor(host, cur ? JSON.parse(JSON.stringify(cur)) : null, setReq);
+    mountRequirementEditor(host, cur ? JSON.parse(JSON.stringify(cur)) : null, setReq, opts);
   }
 
   // ================================================================== REQUIREMENT NODE-GRAPH
@@ -1221,14 +1226,16 @@
   }
 
   // ---- layout: tidy top-down tree (root at top). Manual drags override per-node in model.pos. ----
-  function rgLayout(model) {
-    const LEVEL_H = 96, GAP_X = 26, TOP = 30, LEFT = 90;
+  function rgLayout(model, dims) {
+    const NW = (dims && dims.NW) || RG_NODE_W, NH = (dims && dims.NH) || RG_NODE_H;
+    const LEVEL_H = (dims && dims.LEVEL_H) || 96, GAP_X = (dims && dims.GAP_X) || 26;
+    const TOP = (dims && dims.TOP) || 30, LEFT = (dims && dims.LEFT) || 90;
     let leaf = 0;
     function assign(id, depth) {
       const n = model.nodes[id];
       if (!n) return;
-      n._cy = TOP + depth * LEVEL_H + RG_NODE_H / 2;
-      if (!n.children.length) { n._cx = LEFT + leaf * (RG_NODE_W + GAP_X); leaf++; }
+      n._cy = TOP + depth * LEVEL_H + NH / 2;
+      if (!n.children.length) { n._cx = LEFT + leaf * (NW + GAP_X); leaf++; }
       else {
         n.children.forEach((c) => assign(c, depth + 1));
         const f = model.nodes[n.children[0]]._cx, l = model.nodes[n.children[n.children.length - 1]]._cx;
@@ -1294,9 +1301,15 @@
 
   // The node-graph editor itself. `initial` = current requirement (or null); `onChange(value|null)`
   // fires with the re-serialised requirement on every structural edit.
-  function buildRequirementGraph(host, initial, onChange) {
+  function buildRequirementGraph(host, initial, onChange, opts) {
     clear(host);
     host.classList.add('rg-host');
+    opts = opts || {};
+    // full-screen requirement editor passes { big:true } -> larger nodes + roomier layout that use the space
+    const big = !!opts.big;
+    const NW = big ? 188 : RG_NODE_W, NH = big ? 60 : RG_NODE_H;
+    const dims = big ? { NW: NW, NH: NH, LEVEL_H: 120, GAP_X: 40, TOP: 34, LEFT: 110 } : null;
+    const tY = big ? -5 : -3, sY = big ? 16 : 13, subClip = big ? 30 : 20;
     const model = makeReqGraphModel(initial);
 
     const toolbar = el('div', 'rg-toolbar');
@@ -1310,7 +1323,7 @@
     const posOf = (id) => { const mp = model.pos[id]; if (mp) return mp; const n = model.nodes[id]; return { x: n._cx, y: n._cy }; };
     const rgBtn = (label, cls, fn) => { const b = el('button', 'btn small' + (cls ? ' ' + cls : ''), label); b.type = 'button'; b.onclick = fn; return b; };
 
-    function rerender() { rgLayout(model); drawGraph(); renderToolbar(); renderInspector(); }
+    function rerender() { rgLayout(model, dims); drawGraph(); renderToolbar(); renderInspector(); }
 
     // clicking blank canvas deselects
     svg.addEventListener('mousedown', (e) => { if (e.target === svg || (e.target.classList && e.target.classList.contains('rg-empty-t'))) { model.selected = null; drawGraph(); renderInspector(); } });
@@ -1324,13 +1337,13 @@
         return;
       }
       let maxX = 0, maxY = 0;
-      ids.forEach((id) => { const p = posOf(id); maxX = Math.max(maxX, p.x + RG_NODE_W / 2); maxY = Math.max(maxY, p.y + RG_NODE_H / 2); });
+      ids.forEach((id) => { const p = posOf(id); maxX = Math.max(maxX, p.x + NW / 2); maxY = Math.max(maxY, p.y + NH / 2); });
       const W = Math.max(320, Math.round(maxX + 30)), H = Math.max(120, Math.round(maxY + 30));
       svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H); svg.setAttribute('width', W); svg.setAttribute('height', H);
       // wires first (under nodes)
       ids.forEach((id) => {
         const n = model.nodes[id], p = posOf(id);
-        n.children.forEach((c) => { const cp = posOf(c); svg.append(svgEl('path', { class: 'rgedge', d: rgWirePath(p.x, p.y + RG_NODE_H / 2, cp.x, cp.y - RG_NODE_H / 2) })); });
+        n.children.forEach((c) => { const cp = posOf(c); svg.append(svgEl('path', { class: 'rgedge', d: rgWirePath(p.x, p.y + NH / 2, cp.x, cp.y - NH / 2) })); });
       });
       ids.forEach((id) => svg.append(buildRgNode(id)));
     }
@@ -1339,13 +1352,13 @@
       const n = model.nodes[id], p = posOf(id);
       const cls = 'rgnode ' + (n.kind === 'leaf' ? 'leaf' : 'logic') + (model.selected === id ? ' sel' : '');
       const g = svgEl('g', { class: cls, transform: 'translate(' + p.x + ',' + p.y + ')', 'data-id': id });
-      g.append(svgEl('rect', { class: 'rgbox', x: -RG_NODE_W / 2, y: -RG_NODE_H / 2, width: RG_NODE_W, height: RG_NODE_H, rx: 9 }));
+      g.append(svgEl('rect', { class: 'rgbox', x: -NW / 2, y: -NH / 2, width: NW, height: NH, rx: 9 }));
       if (n.kind === 'leaf') {
-        g.append(svgEl('text', { class: 'rgtitle', x: 0, y: -3, 'text-anchor': 'middle' }, rgLeafType(n.cond)));
-        g.append(svgEl('text', { class: 'rgsub', x: 0, y: 13, 'text-anchor': 'middle' }, rgClip(rgLeafSummary(n.cond), 20)));
+        g.append(svgEl('text', { class: 'rgtitle', x: 0, y: tY, 'text-anchor': 'middle' }, rgLeafType(n.cond)));
+        g.append(svgEl('text', { class: 'rgsub', x: 0, y: sY, 'text-anchor': 'middle' }, rgClip(rgLeafSummary(n.cond), subClip)));
       } else {
-        g.append(svgEl('text', { class: 'rgtitle', x: 0, y: -3, 'text-anchor': 'middle' }, n.kind.toUpperCase()));
-        g.append(svgEl('text', { class: 'rgsub', x: 0, y: 13, 'text-anchor': 'middle' }, n.kind === 'all' ? 'AND — все' : n.kind === 'any' ? 'OR — любое' : 'NOT — инверсия'));
+        g.append(svgEl('text', { class: 'rgtitle', x: 0, y: tY, 'text-anchor': 'middle' }, n.kind.toUpperCase()));
+        g.append(svgEl('text', { class: 'rgsub', x: 0, y: sY, 'text-anchor': 'middle' }, n.kind === 'all' ? 'AND — все' : n.kind === 'any' ? 'OR — любое' : 'NOT — инверсия'));
       }
       g.addEventListener('mousedown', (ev) => onNodeDown(ev, id));
       return g;
@@ -1354,7 +1367,7 @@
     // which node's box is under a model-space point (for drag-drop reparenting)?
     function nodeAt(x, y, exceptId) {
       let hit = null;
-      Object.keys(model.nodes).forEach((id) => { if (id === exceptId) return; const p = posOf(id); if (Math.abs(x - p.x) <= RG_NODE_W / 2 && Math.abs(y - p.y) <= RG_NODE_H / 2) hit = id; });
+      Object.keys(model.nodes).forEach((id) => { if (id === exceptId) return; const p = posOf(id); if (Math.abs(x - p.x) <= NW / 2 && Math.abs(y - p.y) <= NH / 2) hit = id; });
       return hit;
     }
 
@@ -1502,17 +1515,24 @@
   // Toggle wrapper mounted at every requirement host (view / click / open): a compact bar with a
   // «🔗 Граф» button switches the SAME requirement object between the structured/raw builder and the
   // node-graph editor. `currentValue` is kept live across edits so a mode switch never loses the value.
-  function mountRequirementEditor(host, initial, onChange) {
+  function mountRequirementEditor(host, initial, onChange, opts) {
     clear(host);
     host.classList.add('req-editor');
+    opts = opts || {};
     const local = { graph: false };
     let currentValue = initial ? JSON.parse(JSON.stringify(initial)) : null;
 
     const bar = el('div', 'req-mode-bar');
     bar.append(el('span', 'req-mode-lbl', 'Редактор условия'));
+    const btns = el('div', 'req-mode-btns');
     const gbtn = el('button', 'btn small req-graph-toggle', '🔗 Граф');
     gbtn.type = 'button';
-    bar.append(gbtn);
+    // opens THIS requirement (the live currentValue) in the full-screen editor, writing back through the
+    // SAME onChange path (change -> onChange), so round-trip/serialization is identical to the inline editor.
+    const fbtn = el('button', 'btn small req-full-toggle', '⛶ На весь экран');
+    fbtn.type = 'button'; fbtn.title = 'Открыть это условие в большом редакторе';
+    btns.append(gbtn, fbtn);
+    bar.append(btns);
     const body = el('div', 'req-editor-body');
     host.append(bar, body);
 
@@ -1524,6 +1544,7 @@
       else buildRequirementBuilder(body, currentValue, change);
     }
     gbtn.onclick = () => { local.graph = !local.graph; mount(); };
+    fbtn.onclick = () => openReqFullView(opts, currentValue, change);
     mount();
   }
 
@@ -1531,10 +1552,121 @@
   function renderSlotRequirements(disp) {
     buildReqSingle($('req-view'),
       () => (disp && disp['view-requirement']) || null,
-      (req) => writeReqKey('view-requirement', req));
+      (req) => writeReqKey('view-requirement', req),
+      { title: 'Условие показа (view-requirement)', scope: 'slot' });
     buildReqBlock($('req-click'),
       () => (disp && disp['click-requirement']) || null,
-      (block) => writeReqKey('click-requirement', block));
+      (block) => writeReqKey('click-requirement', block),
+      { title: 'Условие клика (click-requirement)', scope: 'slot' });
+  }
+
+  // ================================================================== FULL-SCREEN REQUIREMENT EDITOR
+  // A roomy, dedicated view for ONE requirement (view / click / open), opened by «⛶ На весь экран» from
+  // any requirement panel. It takes over the center+right area exactly like the «Граф» / «Сырой YAML»
+  // view modes (state.reqEdit + #reqedit-wrap + the `reqedit-mode` layout class, driven by syncModes()).
+  // It edits the SAME requirement object through the SAME onChange path the inline editor uses — for
+  // view: writeReqKey('view-requirement', …); for click/open: the block's commit — so serialization is
+  // unchanged. Three tabs (node-graph at full canvas size / structured / raw) all share one live value.
+
+  // context subtitle: which menu (+ slot, for view/click) this requirement belongs to
+  function reqFullSubtitle(scope) {
+    const m = current();
+    const menu = m ? m.id : '—';
+    if (scope === 'menu' || state.active == null) return 'Меню: ' + menu;
+    let s = 'Меню: ' + menu + ' · слот ' + state.active;
+    const n = targetSlots().length;
+    if (n > 1) s += ' (+ ещё ' + (n - 1) + ')';
+    return s;
+  }
+
+  // enter the full-screen editor for `value`, writing edits back through `onChange` (the inline editor's
+  // own change wrapper — identical write path). Mutually exclusive with raw / graph view modes.
+  function openReqFullView(opts, value, onChange) {
+    opts = opts || {};
+    if (!current()) { toast('Нет выбранного меню', 'err'); return; }
+    state.reqEditCtx = {
+      title: opts.title || 'Условие',
+      subtitle: reqFullSubtitle(opts.scope),
+      value: value ? JSON.parse(JSON.stringify(value)) : null,
+      onChange: onChange
+    };
+    state.raw = false; state.graph = false; state.reqEdit = true;
+    syncModes();
+  }
+
+  function closeReqFullView() {
+    state.reqEdit = false; state.reqEditCtx = null;
+    renderAll();   // rebuilds the inline requirement editors from the (now-updated) menu object
+  }
+
+  // full-height raw-YAML editor for a single requirement (the «Сырой YAML» tab of the full view)
+  function buildReqRawFull(host, initial, onChange) {
+    clear(host);
+    host.classList.add('reqedit-raw');
+    const ta = document.createElement('textarea');
+    ta.className = 'in area reqedit-raw-area'; ta.spellcheck = false;
+    ta.value = (initial && typeof initial === 'object')
+      ? jsyaml.dump(initial, { lineWidth: -1, noRefs: true, indent: 2 }).trim() : '';
+    ta.placeholder = 'type: any\nof:\n  - { type: permission, permission: a.b }\n  - { type: money, amount: 100 }';
+    const err = el('div', 'req-raw-err'); err.hidden = true;
+    ta.oninput = () => {
+      const txt = ta.value.trim();
+      if (txt === '') { err.hidden = true; ta.style.borderColor = ''; onChange(null); return; }
+      try {
+        const parsed = jsyaml.load(txt);
+        if (!parsed || typeof parsed !== 'object') throw new Error('ожидается объект');
+        err.hidden = true; ta.style.borderColor = ''; onChange(parsed);
+      } catch (e) {
+        err.textContent = 'YAML: ' + (e && e.message ? e.message : 'ошибка');
+        err.hidden = false; ta.style.borderColor = 'var(--danger)';
+      }
+    };
+    host.append(ta, err);
+  }
+
+  // render the full-screen editor into #reqedit-wrap (called by syncModes when state.reqEdit is on)
+  function renderReqEdit() {
+    const wrap = $('reqedit-wrap');
+    clear(wrap);
+    const ctx = state.reqEditCtx;
+    if (!ctx) { state.reqEdit = false; return; }
+
+    const head = el('div', 'reqedit-head');
+    const back = el('button', 'btn reqedit-back', '← Назад'); back.type = 'button';
+    back.onclick = closeReqFullView;
+    const titles = el('div', 'reqedit-titles');
+    titles.append(el('div', 'reqedit-title', ctx.title));
+    if (ctx.subtitle) titles.append(el('div', 'reqedit-sub', ctx.subtitle));
+    head.append(back, titles);
+    wrap.append(head);
+
+    const tabs = el('div', 'reqedit-tabs');
+    const body = el('div', 'reqedit-body');
+    const local = { mode: 'graph' };   // open on the node-graph (the star feature), like the «Граф» view
+    let currentValue = ctx.value ? JSON.parse(JSON.stringify(ctx.value)) : null;
+    // one live value shared by all three tabs; every edit writes back through the inline editor's path
+    function change(val) { currentValue = val ? JSON.parse(JSON.stringify(val)) : null; ctx.onChange(val); }
+
+    const tabDefs = [['graph', '🔗 Граф'], ['simple', 'Простой'], ['raw', 'Сырой YAML']];
+    const tabBtns = {};
+    function mountBody() {
+      // reset the body class each mount: the builders add their own class to the host (req-builder /
+      // reqedit-raw / rg-host), which would otherwise accumulate across tab switches.
+      const graph = local.mode === 'graph';
+      body.className = 'reqedit-body' + (graph ? ' reqedit-body-graph' : '');
+      clear(body);
+      if (graph) buildRequirementGraph(body, currentValue, change, { big: true });
+      else if (local.mode === 'simple') buildRequirementBuilder(body, currentValue, change);
+      else buildReqRawFull(body, currentValue, change);
+      Object.keys(tabBtns).forEach((k) => tabBtns[k].classList.toggle('active', k === local.mode));
+    }
+    tabDefs.forEach(([k, label]) => {
+      const b = el('button', 'btn small reqedit-tab', label); b.type = 'button';
+      b.onclick = () => { if (local.mode === k) return; local.mode = k; mountBody(); };
+      tabBtns[k] = b; tabs.append(b);
+    });
+    wrap.append(tabs, body);
+    mountBody();
   }
 
   // ================================================================== ICONS (model-JSON aware)
@@ -1967,10 +2099,13 @@
     $('graph-toggle').setAttribute('aria-pressed', state.graph ? 'true' : 'false');
     layout.classList.toggle('raw-mode', state.raw);
     layout.classList.toggle('graph-mode', state.graph);
+    layout.classList.toggle('reqedit-mode', state.reqEdit);
     $('raw-wrap').hidden = !state.raw;
     $('graph-wrap').hidden = !state.graph;
+    $('reqedit-wrap').hidden = !state.reqEdit;
     if (state.raw) dumpRaw();
     if (state.graph) renderGraph();
+    if (state.reqEdit) renderReqEdit();
   }
 
   function dumpRaw() {
@@ -2002,7 +2137,7 @@
       renderAll();
     } else {
       if (!current()) { toast('Нет выбранного меню', 'err'); return; }
-      state.graph = false;   // mutually exclusive
+      state.graph = false; state.reqEdit = false; state.reqEditCtx = null;   // mutually exclusive
       state.raw = true;
       syncModes();
     }
@@ -2014,6 +2149,7 @@
       renderAll();
     } else {
       if (state.raw) { if (!commitRaw()) { toast('Исправь YAML, затем переключись', 'err'); return; } state.raw = false; }
+      state.reqEdit = false; state.reqEditCtx = null;
       state.graph = true;
       syncModes();
     }

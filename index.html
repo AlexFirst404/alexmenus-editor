@@ -110,6 +110,10 @@
         <svg id="graph-svg" aria-label="Граф навигации по меню"></svg>
         <div class="graph-empty" id="graph-empty" hidden>Нет меню для отображения графа.</div>
       </div>
+
+      <!-- Full-screen requirement editor (opened by «⛶ На весь экран» from any requirement panel).
+           Takes over the center area like graph-wrap; content is built by renderReqEdit(). -->
+      <div class="reqedit-wrap" id="reqedit-wrap" hidden></div>
     </section>
 
     <!-- ---------- RIGHT PANEL: slot editor ---------- -->
