@@ -131,9 +131,19 @@
           <div class="mat-row">
             <span class="mat-ic" id="mat-ic" aria-hidden="true"></span>
             <input type="text" id="f-material" class="in" placeholder="STONE / minecraft:paper" />
+            <button class="btn small" id="f-material-pick" type="button" title="Выбрать материал из списка">Выбрать…</button>
           </div>
         </label>
 
+        <!-- Empty-slot state: no material chosen yet. Prominent picker button + hint; the rest of the
+             editor is hidden until a material exists, so nothing ever auto-creates a STONE item. -->
+        <div class="nomat-hint" id="slot-nomat-hint" hidden>
+          <button class="btn primary block" id="f-material-pick-big" type="button">Выбрать материал</button>
+          <p class="faint">Сначала выберите материал — тогда появятся имя, лор, флаги, действия и требования. Пустой слот не создаёт предмет.</p>
+        </div>
+
+        <!-- Full item editor, shown only once the active slot holds an item -->
+        <div class="slot-rest" id="slot-rest">
         <label class="field">
           <span class="lbl">custom-model-data (cmd)</span>
           <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
@@ -177,6 +187,7 @@
             <div class="req-block" id="req-click"></div>
           </div>
         </div>
+        </div><!-- /#slot-rest -->
       </div>
     </aside>
   </main>
@@ -246,6 +257,22 @@
       <p class="faint">Код действует ограниченное время. Если он истёк — сохрани заново.</p>
       <div class="modal-actions">
         <button class="btn primary" id="sm-close" type="button">Готово</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== MATERIAL PICKER MODAL ===================== -->
+  <div class="overlay" id="material-modal" hidden>
+    <div class="modal mp-modal" role="dialog" aria-modal="true" aria-labelledby="mp-title">
+      <div class="mp-head">
+        <h2 id="mp-title">Выбор материала</h2>
+        <button class="btn icon" id="mp-close" type="button" aria-label="Закрыть">×</button>
+      </div>
+      <input type="text" id="mp-search" class="in" placeholder="Поиск: diamond, sword, меч…" autocomplete="off" />
+      <div class="mp-loading muted" id="mp-loading" hidden>Загрузка списка материалов…</div>
+      <div class="mp-note faint" id="mp-note" hidden></div>
+      <div class="mp-scroll" id="mp-scroll">
+        <div class="mp-grid" id="mp-grid"></div>
       </div>
     </div>
   </div>

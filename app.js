@@ -18,6 +18,13 @@
   const ICON_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/textures/';
   const MODEL_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/models/';
   const ITEMDEF_BASE = 'https://assets.mcasset.cloud/1.21.11/assets/minecraft/items/'; // 1.21.4 item-definitions
+  // deepslate WebGL block renderer (optional, loaded lazily on first block icon). Renders BLOCK items
+  // as exact 1.21.11 3D inventory images; flat item/generated items keep the cheaper texture path.
+  // All three endpoints verified 200 + `Access-Control-Allow-Origin: *` (canvas-clean).
+  const DEEPSLATE_URL = 'https://cdn.jsdelivr.net/npm/deepslate@0.26.0/+esm';
+  const ATLAS_PNG_URL = 'https://cdn.jsdelivr.net/gh/misode/mcmeta@1.21.11-atlas/all/atlas.png';
+  const ATLAS_DATA_URL = 'https://cdn.jsdelivr.net/gh/misode/mcmeta@1.21.11-atlas/all/data.min.json';
+  const DS_RENDER_PX = 64; // resolution of the single reused offscreen WebGL2 canvas
   // face-texture priority lists for resolving a cube's top/side from a model's textures map
   const TOP_KEYS = ['up', 'top', 'end', 'all', 'side', 'north', 'texture', 'particle', 'wall', 'cross'];
   const SIDE_KEYS = ['side', 'north', 'west', 'south', 'east', 'all', 'texture', 'particle', 'wall', 'up', 'top'];
@@ -40,20 +47,22 @@
     try { if (clean) localStorage.setItem(WORKER_STORE_KEY, clean); } catch (e) { /* private mode */ }
     return clean;
   }
-  function askWorker() {
-    const msg = 'Адрес paste-воркера (из config.yml плагина, поле editor.worker-url),\n'
+  // async: uses the themed modalPrompt (no browser prompt). Rarely reached now that DEFAULT_WORKER
+  // is set, but kept for forks that blank the default.
+  async function askWorker() {
+    const msg = 'Адрес paste-воркера (из config.yml плагина, поле editor.worker-url), '
               + 'напр. https://alexmenus-paste.<акк>.workers.dev';
-    const inp = window.prompt(msg, storedWorker() || 'https://');
+    const inp = await modalPrompt('Адрес paste-воркера', { label: msg, value: storedWorker() || 'https://', placeholder: 'https://…' });
     return inp == null ? '' : rememberWorker(inp);
   }
   // Resolve the Worker for this session: an explicit `?w=` wins (and is remembered); otherwise the baked
   // default is used (zero-config — and it takes precedence over any stale saved value, e.g. an old worker
   // URL a tester typed before the default existed). Forks that blank DEFAULT_WORKER fall back to storage/prompt.
-  function resolveWorker(fromParam) {
+  async function resolveWorker(fromParam) {
     const w = (fromParam || '').trim().replace(/\/+$/, '');
     if (w) return rememberWorker(w);
     if (DEFAULT_WORKER) return DEFAULT_WORKER;
-    return storedWorker() || askWorker();
+    return storedWorker() || await askWorker();
   }
 
   // click-kind id -> Russian label
@@ -123,7 +132,7 @@
   function resetSelection() { state.selected = new Set(); state.active = null; }
 
   // ================================================================== INIT
-  function init() {
+  async function init() {
     wireStaticUi();
     const hash = parseHash();
     if (!hash.k) {
@@ -132,7 +141,7 @@
       return;
     }
     state.code = hash.k;
-    state.workerBase = resolveWorker(hash.w);
+    state.workerBase = await resolveWorker(hash.w);
     if (!state.workerBase) {   // no worker configured for this browser -> can't load; explain
       show('empty-state');
       return;
@@ -403,7 +412,8 @@
       else state.selected.add(slot);
       state.active = slot;
     } else {
-      ensureElement(slot);        // plain click on empty cell creates an element
+      // plain click selects the cell; the item is materialised only once a material is chosen
+      // (via the picker or the material field) — an empty slot never becomes a STONE placeholder.
       state.selected = new Set([slot]);
       state.active = slot;
     }
@@ -486,12 +496,19 @@
 
     $('slot-num').textContent = n > 1 ? (state.active + ' + ещё ' + (n - 1)) : String(state.active);
 
-    // material (+ live icon) — bulk
+    // material (+ live icon) — bulk. Typing a material CREATES the item(s) with exactly that
+    // material (never a STONE default); the picker button opens the full material list (feature 4).
     const fMat = $('f-material');
     fMat.value = disp.material != null ? String(disp.material) : '';
     setMatIcon(disp.material);
-    fMat.oninput = () => applyBulk((it) => { it.material = fMat.value; }, false);
-    fMat.onchange = () => { setMatIcon(fMat.value); renderGrid(); };
+    fMat.oninput = () => assignMaterialLive(fMat.value);
+    fMat.onchange = () => { setMatIcon(fMat.value); renderGrid(); renderProps(); };
+
+    // EMPTY-slot state: no item yet -> show the "pick a material" prompt and HIDE the rest of the
+    // editor, so name/lore/flags/requirements can never materialise a STONE placeholder.
+    $('slot-nomat-hint').hidden = !!real;
+    $('slot-rest').hidden = !real;
+    if (!real) return;
 
     // cmd (custom-model-data) — bulk
     const fCmd = $('f-cmd');
@@ -565,6 +582,7 @@
       const add = el('button', 'btn small add-action', '＋ действие');
       add.onclick = () => {
         const real = ensureActiveElement();
+        if (!real) return;   // no item yet (empty slot) — pick a material first
         if (!real.clicks) real.clicks = {};
         if (!Array.isArray(real.clicks[kind])) real.clicks[kind] = [];
         real.clicks[kind].push({ type: 'run_command', command: '', as: 'player' });
@@ -715,30 +733,64 @@
     if (!m || state.active == null || !m.obj.items) return null;
     return m.obj.items[String(state.active)] || null;
   }
-  // ensure an element exists at the active slot, return it
+  // the active slot's element, or null. Does NOT auto-create (click-editing only renders once an
+  // item exists), so it can never introduce a STONE placeholder.
   function ensureActiveElement() {
     const m = current();
-    if (!m) return null;
-    if (!m.obj.items) m.obj.items = {};
-    const k = String(state.active);
-    if (!m.obj.items[k]) m.obj.items[k] = { material: 'STONE' };
-    return m.obj.items[k];
+    if (!m || state.active == null || !m.obj.items) return null;
+    return m.obj.items[String(state.active)] || null;
   }
-  function ensureElement(slot) {
-    const m = current();
-    if (!m) return;
-    if (!m.obj.items) m.obj.items = {};
-    if (!m.obj.items[String(slot)]) m.obj.items[String(slot)] = { material: 'STONE' };
+  // material used when a bulk edit must CREATE an item in a selected-but-empty slot: the active
+  // slot's own material (so name/lore/flags spread with the right item), or null when there is none.
+  function creationMaterial() {
+    const a = activeItem();
+    return (a && a.material != null && String(a.material).trim() !== '') ? a.material : null;
   }
-  // element objects for every target slot (creating a default where empty)
+  // element objects for every target slot. Missing items are created with creationMaterial(); if
+  // there is no chosen material, the empty slot is SKIPPED — we never invent a STONE placeholder.
   function targetItems() {
     const m = current();
     if (!m) return [];
     if (!m.obj.items) m.obj.items = {};
-    return targetSlots().map((slot) => {
+    const mat = creationMaterial();
+    const out = [];
+    targetSlots().forEach((slot) => {
       const k = String(slot);
-      if (!m.obj.items[k]) m.obj.items[k] = { material: 'STONE' };
-      return m.obj.items[k];
+      if (!m.obj.items[k]) {
+        if (mat == null) return;
+        m.obj.items[k] = { material: mat };
+      }
+      out.push(m.obj.items[k]);
+    });
+    return out;
+  }
+  // Live material edit from the text field: set material on the active slot + every selected slot,
+  // creating items ONLY where a non-empty material is given (never a STONE default).
+  function assignMaterialLive(val) {
+    const m = current();
+    if (!m) return;
+    if (!m.obj.items) m.obj.items = {};
+    const before = filledCount();
+    const empty = String(val).trim() === '';
+    targetSlots().forEach((s) => {
+      const k = String(s);
+      if (empty) delete m.obj.items[k];              // clearing the material removes the item (no phantom {material:''})
+      else if (m.obj.items[k]) m.obj.items[k].material = val;
+      else m.obj.items[k] = { material: val };
+    });
+    updateSelCounter();
+    if (filledCount() !== before) renderGrid();
+  }
+  // Assign a concrete material (from the picker) to the given slots: create items where missing with
+  // that material, otherwise just change the material. Never uses a STONE default.
+  function assignMaterial(mat, slots) {
+    const m = current();
+    if (!m) return;
+    if (!m.obj.items) m.obj.items = {};
+    slots.forEach((s) => {
+      const k = String(s);
+      if (m.obj.items[k]) m.obj.items[k].material = mat;
+      else m.obj.items[k] = { material: mat };
     });
   }
   function filledCount() {
@@ -1019,7 +1071,7 @@
     host.append(el('span', 'req-sub-lbl', 'Условие (require)'));
     const reqHost = el('div');
     host.append(reqHost);
-    buildRequirementBuilder(reqHost, work.require, (val) => { work.require = val; commit(); });
+    mountRequirementEditor(reqHost, work.require, (val) => { work.require = val; commit(); });
 
     host.append(el('span', 'req-sub-lbl', 'При отказе (deny)'));
     const denyHost = el('div', 'req-actions');
@@ -1046,7 +1098,433 @@
   // single (bare) requirement editor — used for view-requirement
   function buildReqSingle(host, getReq, setReq) {
     const cur = getReq();
-    buildRequirementBuilder(host, cur ? JSON.parse(JSON.stringify(cur)) : null, setReq);
+    mountRequirementEditor(host, cur ? JSON.parse(JSON.stringify(cur)) : null, setReq);
+  }
+
+  // ================================================================== REQUIREMENT NODE-GRAPH
+  // A visual "block-programming" editor for the SAME requirement tree the structured/raw builders
+  // edit. It renders the requirement as SVG nodes + wires (reusing the «Граф» drag/render approach):
+  // logic nodes (ALL/ANY/NOT, accent-coloured) wired to their children, leaf condition nodes showing
+  // type + a short summary. The internal model (nodes keyed by generated ids) is serialised to/from
+  // the EXACT data-model shape the plugin parses:
+  //   leaf  -> { type, ...fields, negate? }
+  //   all/any -> { type:'all'|'any', of:[ <child>, ... ] }   (AND / OR)
+  //   not   -> { type:'not', of: <child> }                    (single child)
+  // The whole requirement is one root node. Every graph edit re-serialises and writes back through the
+  // SAME onChange path the structured builder uses, so Save / raw-YAML round-trip correctly.
+
+  const RG_NODE_W = 140, RG_NODE_H = 48;   // node box size (shared by layout + render)
+
+  // ---- model <-> requirement-object serialisation (the CRITICAL correctness path) ----
+
+  // Build internal nodes from a requirement object; returns the new node id (parent linkage set).
+  function reqToNodes(model, reqObj, parentId) {
+    const id = model.newId();
+    const t = reqObj && typeof reqObj === 'object' ? reqObj.type : null;
+    if (t === 'all' || t === 'any') {
+      const node = { id, kind: t, cond: null, children: [], parent: parentId };
+      model.nodes[id] = node;
+      const of = Array.isArray(reqObj.of) ? reqObj.of : [];
+      of.forEach((c) => { if (c != null) node.children.push(reqToNodes(model, c, id)); });
+    } else if (t === 'not') {
+      const node = { id, kind: 'not', cond: null, children: [], parent: parentId };
+      model.nodes[id] = node;
+      const ch = reqObj.of;   // a single requirement, OR (list-form) the negation of an implicit `all`
+      if (Array.isArray(ch)) {
+        const items = ch.filter((c) => c != null);
+        if (items.length === 1) {
+          node.children.push(reqToNodes(model, items[0], id));
+        } else if (items.length > 1) {
+          // list-form NOT = !(A and B …) → NOT over an implicit ALL, so no child is dropped
+          const allId = model.newId();
+          model.nodes[allId] = { id: allId, kind: 'all', cond: null, children: [], parent: id };
+          items.forEach((c) => model.nodes[allId].children.push(reqToNodes(model, c, allId)));
+          node.children.push(allId);
+        }
+      } else if (ch != null && typeof ch === 'object') {
+        node.children.push(reqToNodes(model, ch, id));
+      }
+    } else {
+      // leaf condition (permission/placeholder/money/has_item/exp, or any unrecognised leaf)
+      const cond = (reqObj && typeof reqObj === 'object') ? JSON.parse(JSON.stringify(reqObj)) : { type: 'permission', permission: '' };
+      model.nodes[id] = { id, kind: 'leaf', cond, children: [], parent: parentId };
+    }
+    return id;
+  }
+
+  // Walk the model from the root and produce the requirement object (or null when empty). Produces a
+  // FRESH object each call (never aliases model.cond), so writing it back can't be mutated underfoot.
+  function serializeGraph(model) {
+    function walk(id) {
+      const n = model.nodes[id];
+      if (!n) return null;
+      if (n.kind === 'all' || n.kind === 'any') {
+        const of = n.children.map(walk).filter((x) => x != null);
+        return of.length ? { type: n.kind, of } : null;   // empty group => null (NOT a fails-open {of:[]})
+      }
+      if (n.kind === 'not') {
+        const of = n.children.map(walk).filter((x) => x != null);
+        if (!of.length) return null;                        // childless NOT => null (NOT a fails-closed {of:null})
+        return { type: 'not', of: of.length === 1 ? of[0] : { type: 'all', of } };
+      }
+      return JSON.parse(JSON.stringify(n.cond));   // leaf
+    }
+    if (!model.rootId || !model.nodes[model.rootId]) return null;
+    return walk(model.rootId);
+  }
+
+  // fresh model (optionally seeded from an existing requirement object)
+  function makeReqGraphModel(initial) {
+    let counter = 0;
+    const model = { nodes: {}, rootId: null, pos: {}, selected: null, newId: () => 'rg' + (++counter) };
+    if (initial && typeof initial === 'object') model.rootId = reqToNodes(model, initial, null);
+    return model;
+  }
+
+  // ---- model mutations (all keep parent/children consistent + predictable) ----
+  function rgRemoveSubtree(model, id) {
+    const n = model.nodes[id];
+    if (!n) return;
+    n.children.slice().forEach((c) => rgRemoveSubtree(model, c));
+    delete model.nodes[id];
+    delete model.pos[id];
+  }
+  // is `ancestorId` an ancestor of (or equal to) `id`?  (walk up the parent chain)
+  function rgIsAncestor(model, ancestorId, id) {
+    let c = id;
+    while (c != null) { if (c === ancestorId) return true; const n = model.nodes[c]; c = n ? n.parent : null; }
+    return false;
+  }
+  // replace node `id` (and its subtree) with the deserialised `reqObj`, keeping its slot under its parent
+  function rgReplaceSubtree(model, id, reqObj) {
+    const n = model.nodes[id];
+    const parentId = n ? n.parent : null;
+    const parent = parentId != null ? model.nodes[parentId] : null;
+    const idx = parent ? parent.children.indexOf(id) : -1;
+    rgRemoveSubtree(model, id);
+    const nid = reqToNodes(model, reqObj, parentId);
+    if (parent) { if (idx >= 0) parent.children[idx] = nid; else parent.children.push(nid); }
+    else model.rootId = nid;
+    return nid;
+  }
+  // drag-drop reparent: move `id` under logic node `newParentId` (guards cycles + NOT-arity + leaf targets)
+  function rgReparent(model, id, newParentId) {
+    if (id === newParentId) return false;
+    const n = model.nodes[id], np = model.nodes[newParentId];
+    if (!n || !np || np.kind === 'leaf') return false;
+    if (rgIsAncestor(model, id, newParentId)) return false;                 // target is inside the dragged subtree
+    if (np.kind === 'not' && np.children.length >= 1 && np.children[0] !== id) return false; // NOT is single-child
+    if (n.parent != null) { const op = model.nodes[n.parent]; if (op) { const i = op.children.indexOf(id); if (i >= 0) op.children.splice(i, 1); } }
+    n.parent = newParentId;
+    if (np.children.indexOf(id) < 0) np.children.push(id);
+    return true;
+  }
+
+  // ---- layout: tidy top-down tree (root at top). Manual drags override per-node in model.pos. ----
+  function rgLayout(model) {
+    const LEVEL_H = 96, GAP_X = 26, TOP = 30, LEFT = 90;
+    let leaf = 0;
+    function assign(id, depth) {
+      const n = model.nodes[id];
+      if (!n) return;
+      n._cy = TOP + depth * LEVEL_H + RG_NODE_H / 2;
+      if (!n.children.length) { n._cx = LEFT + leaf * (RG_NODE_W + GAP_X); leaf++; }
+      else {
+        n.children.forEach((c) => assign(c, depth + 1));
+        const f = model.nodes[n.children[0]]._cx, l = model.nodes[n.children[n.children.length - 1]]._cx;
+        n._cx = (f + l) / 2;
+      }
+    }
+    if (model.rootId && model.nodes[model.rootId]) assign(model.rootId, 0);
+  }
+
+  // ---- leaf display helpers ----
+  function rgClip(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  function rgLeafType(cond) { return (cond && cond.negate ? '¬ ' : '') + (cond && cond.type ? cond.type : '?'); }
+  function rgLeafSummary(cond) {
+    if (!cond || typeof cond !== 'object') return '?';
+    const neg = cond.negate ? '¬ ' : '';
+    switch (cond.type) {
+      case 'permission': return neg + 'perm: ' + (cond.permission || '—');
+      case 'placeholder': return neg + (cond.placeholder || '?') + ' ' + (cond.operator || '==') + ' ' + (cond.value != null ? cond.value : '');
+      case 'money': return neg + 'money ≥ ' + (cond.amount != null ? cond.amount : 0);
+      case 'has_item': return neg + ((cond.amount > 1 ? cond.amount + '× ' : '')) + (cond.material || '?');
+      case 'exp': return neg + 'exp ' + (cond.amount != null ? cond.amount : 0) + (cond.level ? ' lvl' : '');
+      default: return neg + (cond.type || '?');
+    }
+  }
+  function rgWirePath(px, py, cx, cy) { const my = (py + cy) / 2; return 'M ' + px + ' ' + py + ' C ' + px + ' ' + my + ', ' + cx + ' ' + my + ', ' + cx + ' ' + cy; }
+
+  // Modal that hosts the existing single-condition builder; resolves the edited condition object,
+  // `null` (cleared), or `undefined` (cancel). Reused for both "add condition" and "edit leaf".
+  function openReqLeafModal(initialCond, title) {
+    return new Promise((resolve) => {
+      const seed = initialCond ? JSON.parse(JSON.stringify(initialCond)) : null;
+      let latest = seed ? JSON.parse(JSON.stringify(seed)) : null;
+
+      const overlay = el('div', 'overlay');
+      const modal = el('div', 'modal');
+      modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
+      modal.append(el('h2', null, title || 'Условие'));
+      const bhost = el('div');
+      modal.append(bhost);
+      buildRequirementBuilder(bhost, seed, (val) => { latest = val; });
+
+      const actions = el('div', 'modal-actions');
+      const cancel = el('button', 'btn', 'Отмена'); cancel.type = 'button';
+      const ok = el('button', 'btn primary', 'Сохранить'); ok.type = 'button';
+      actions.append(cancel, ok);
+      modal.append(actions);
+      overlay.append(modal);
+
+      let settled = false;
+      const finish = (v) => { if (settled) return; settled = true; document.removeEventListener('keydown', onKey, true); overlay.remove(); resolve(v); };
+      cancel.onclick = () => finish(undefined);
+      ok.onclick = () => finish(latest);
+      overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) finish(undefined); });
+      // capture-phase Esc (stopPropagation) so the global overlay-closer never double-fires
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); finish(undefined); }
+        else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); e.stopPropagation(); ok.click(); }
+      };
+      document.addEventListener('keydown', onKey, true);
+      document.body.append(overlay);
+    });
+  }
+
+  // The node-graph editor itself. `initial` = current requirement (or null); `onChange(value|null)`
+  // fires with the re-serialised requirement on every structural edit.
+  function buildRequirementGraph(host, initial, onChange) {
+    clear(host);
+    host.classList.add('rg-host');
+    const model = makeReqGraphModel(initial);
+
+    const toolbar = el('div', 'rg-toolbar');
+    const canvas = el('div', 'rg-canvas');
+    const svg = svgEl('svg', { class: 'rg-svg' });
+    canvas.append(svg);
+    const inspector = el('div', 'rg-inspector');
+    host.append(toolbar, canvas, inspector);
+
+    const commit = () => onChange(serializeGraph(model));
+    const posOf = (id) => { const mp = model.pos[id]; if (mp) return mp; const n = model.nodes[id]; return { x: n._cx, y: n._cy }; };
+    const rgBtn = (label, cls, fn) => { const b = el('button', 'btn small' + (cls ? ' ' + cls : ''), label); b.type = 'button'; b.onclick = fn; return b; };
+
+    function rerender() { rgLayout(model); drawGraph(); renderToolbar(); renderInspector(); }
+
+    // clicking blank canvas deselects
+    svg.addEventListener('mousedown', (e) => { if (e.target === svg || (e.target.classList && e.target.classList.contains('rg-empty-t'))) { model.selected = null; drawGraph(); renderInspector(); } });
+
+    function drawGraph() {
+      clear(svg);
+      const ids = Object.keys(model.nodes);
+      if (!ids.length) {
+        svg.setAttribute('viewBox', '0 0 320 120'); svg.setAttribute('width', 320); svg.setAttribute('height', 120);
+        svg.append(svgEl('text', { class: 'rg-empty-t', x: 160, y: 62, 'text-anchor': 'middle' }, 'Пусто — добавьте условие или группу'));
+        return;
+      }
+      let maxX = 0, maxY = 0;
+      ids.forEach((id) => { const p = posOf(id); maxX = Math.max(maxX, p.x + RG_NODE_W / 2); maxY = Math.max(maxY, p.y + RG_NODE_H / 2); });
+      const W = Math.max(320, Math.round(maxX + 30)), H = Math.max(120, Math.round(maxY + 30));
+      svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H); svg.setAttribute('width', W); svg.setAttribute('height', H);
+      // wires first (under nodes)
+      ids.forEach((id) => {
+        const n = model.nodes[id], p = posOf(id);
+        n.children.forEach((c) => { const cp = posOf(c); svg.append(svgEl('path', { class: 'rgedge', d: rgWirePath(p.x, p.y + RG_NODE_H / 2, cp.x, cp.y - RG_NODE_H / 2) })); });
+      });
+      ids.forEach((id) => svg.append(buildRgNode(id)));
+    }
+
+    function buildRgNode(id) {
+      const n = model.nodes[id], p = posOf(id);
+      const cls = 'rgnode ' + (n.kind === 'leaf' ? 'leaf' : 'logic') + (model.selected === id ? ' sel' : '');
+      const g = svgEl('g', { class: cls, transform: 'translate(' + p.x + ',' + p.y + ')', 'data-id': id });
+      g.append(svgEl('rect', { class: 'rgbox', x: -RG_NODE_W / 2, y: -RG_NODE_H / 2, width: RG_NODE_W, height: RG_NODE_H, rx: 9 }));
+      if (n.kind === 'leaf') {
+        g.append(svgEl('text', { class: 'rgtitle', x: 0, y: -3, 'text-anchor': 'middle' }, rgLeafType(n.cond)));
+        g.append(svgEl('text', { class: 'rgsub', x: 0, y: 13, 'text-anchor': 'middle' }, rgClip(rgLeafSummary(n.cond), 20)));
+      } else {
+        g.append(svgEl('text', { class: 'rgtitle', x: 0, y: -3, 'text-anchor': 'middle' }, n.kind.toUpperCase()));
+        g.append(svgEl('text', { class: 'rgsub', x: 0, y: 13, 'text-anchor': 'middle' }, n.kind === 'all' ? 'AND — все' : n.kind === 'any' ? 'OR — любое' : 'NOT — инверсия'));
+      }
+      g.addEventListener('mousedown', (ev) => onNodeDown(ev, id));
+      return g;
+    }
+
+    // which node's box is under a model-space point (for drag-drop reparenting)?
+    function nodeAt(x, y, exceptId) {
+      let hit = null;
+      Object.keys(model.nodes).forEach((id) => { if (id === exceptId) return; const p = posOf(id); if (Math.abs(x - p.x) <= RG_NODE_W / 2 && Math.abs(y - p.y) <= RG_NODE_H / 2) hit = id; });
+      return hit;
+    }
+
+    // drag = reposition; a no-move click selects; dropping onto a logic node reparents (best-effort).
+    function onNodeDown(ev, id) {
+      ev.preventDefault(); ev.stopPropagation();
+      const start = { x: ev.clientX, y: ev.clientY };
+      let moved = false;
+      const move = (e) => {
+        if (!moved && Math.hypot(e.clientX - start.x, e.clientY - start.y) < 4) return;
+        moved = true;
+        const pt = svgPoint(svg, e.clientX, e.clientY);
+        model.pos[id] = { x: pt.x, y: pt.y };
+        drawGraph();
+      };
+      const up = (e) => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        if (!moved) { model.selected = id; drawGraph(); renderInspector(); return; }
+        const pt = svgPoint(svg, e.clientX, e.clientY);
+        const target = nodeAt(pt.x, pt.y, id);
+        if (target && rgReparent(model, id, target)) { delete model.pos[id]; model.selected = id; commit(); }
+        rerender();
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    }
+
+    // ---- operations (each mutates the model, re-serialises, re-renders) ----
+    async function addCondChild(parentId) {
+      const cond = await openReqLeafModal({ type: 'permission', permission: '' }, 'Новое условие');
+      if (cond === undefined || cond == null) return;   // cancel / empty
+      const nid = reqToNodes(model, cond, parentId != null ? parentId : null);
+      if (parentId != null) model.nodes[parentId].children.push(nid); else model.rootId = nid;
+      model.selected = nid; commit(); rerender();
+    }
+    function addLogicChild(parentId, kind) {
+      const id = model.newId();
+      model.nodes[id] = { id, kind, cond: null, children: [], parent: parentId != null ? parentId : null };
+      if (parentId != null) model.nodes[parentId].children.push(id); else model.rootId = id;
+      model.selected = id; commit(); rerender();
+    }
+    function changeKind(id, kind) {
+      const n = model.nodes[id];
+      if (!n || n.kind === 'leaf' || n.kind === kind) return;
+      if (kind === 'not' && n.children.length > 1) { n.children.slice(1).forEach((c) => rgRemoveSubtree(model, c)); n.children = n.children.slice(0, 1); }
+      n.kind = kind; commit(); rerender();
+    }
+    function wrapNode(id, kind) {
+      const n = model.nodes[id];
+      if (!n) return;
+      const wid = model.newId(), parentId = n.parent;
+      model.nodes[wid] = { id: wid, kind, cond: null, children: [id], parent: parentId };
+      if (parentId != null) { const p = model.nodes[parentId]; const i = p.children.indexOf(id); if (i >= 0) p.children[i] = wid; else p.children.push(wid); }
+      else model.rootId = wid;
+      n.parent = wid; model.selected = wid; commit(); rerender();
+    }
+    function deleteNode(id) {
+      const n = model.nodes[id];
+      if (!n) return;
+      const parentId = n.parent;
+      rgRemoveSubtree(model, id);
+      if (model.rootId === id) model.rootId = null;
+      if (parentId != null) { const p = model.nodes[parentId]; if (p) { const i = p.children.indexOf(id); if (i >= 0) p.children.splice(i, 1); } }
+      model.selected = parentId != null ? parentId : null;
+      commit(); rerender();
+    }
+    async function editLeaf(id) {
+      const n = model.nodes[id];
+      if (!n || n.kind !== 'leaf') return;
+      const res = await openReqLeafModal(n.cond, 'Условие');
+      if (res === undefined) return;                       // cancel
+      if (res == null) { deleteNode(id); return; }         // cleared -> remove
+      if (res.type === 'all' || res.type === 'any' || res.type === 'not') { model.selected = rgReplaceSubtree(model, id, res); commit(); rerender(); return; }
+      n.cond = JSON.parse(JSON.stringify(res)); commit(); rerender();
+    }
+
+    function renderToolbar() {
+      clear(toolbar);
+      if (!model.rootId) {
+        toolbar.append(el('span', 'rg-tb-lbl', 'Пусто. Начните с:'));
+        toolbar.append(rgBtn('＋ Условие', '', () => addCondChild(null)));
+        toolbar.append(rgBtn('＋ ALL', '', () => addLogicChild(null, 'all')));
+        toolbar.append(rgBtn('＋ ANY', '', () => addLogicChild(null, 'any')));
+        toolbar.append(rgBtn('＋ NOT', '', () => addLogicChild(null, 'not')));
+      } else {
+        toolbar.append(el('span', 'rg-tb-lbl', 'Клик — выбрать · тяни узел на группу — вложить'));
+        toolbar.append(rgBtn('Сбросить', 'danger-ghost', async () => {
+          if (await modalConfirm('Сбросить условие', 'Удалить все узлы графа условия?')) {
+            model.nodes = {}; model.pos = {}; model.rootId = null; model.selected = null; commit(); rerender();
+          }
+        }));
+      }
+    }
+
+    function renderInspector() {
+      clear(inspector);
+      const id = model.selected;
+      if (id == null || !model.nodes[id]) { inspector.append(el('div', 'rg-ins-hint', 'Выберите узел на графе, чтобы редактировать его.')); return; }
+      const n = model.nodes[id];
+
+      const head = el('div', 'rg-ins-head');
+      if (n.kind === 'leaf') { head.append(el('span', 'rg-ins-kind leaf', 'условие')); head.append(el('span', 'rg-ins-sum', rgLeafSummary(n.cond))); }
+      else { head.append(el('span', 'rg-ins-kind logic', n.kind.toUpperCase())); head.append(el('span', 'rg-ins-sum', n.kind === 'all' ? 'все условия (AND)' : n.kind === 'any' ? 'любое условие (OR)' : 'инверсия (NOT)')); }
+      inspector.append(head);
+
+      const row1 = el('div', 'rg-ins-row');
+      if (n.kind === 'leaf') {
+        row1.append(rgBtn('✎ Редактировать', '', () => editLeaf(id)));
+      } else {
+        row1.append(el('span', 'rg-ins-lbl', 'Тип:'));
+        ['all', 'any', 'not'].forEach((k) => row1.append(rgBtn(k.toUpperCase(), n.kind === k ? 'primary' : '', () => changeKind(id, k))));
+      }
+      inspector.append(row1);
+
+      if (n.kind !== 'leaf') {
+        const addRow = el('div', 'rg-ins-row');
+        if (n.kind === 'not' && n.children.length >= 1) {
+          addRow.append(el('span', 'rg-ins-hint', 'NOT содержит одно условие (удалите его, чтобы заменить)'));
+        } else {
+          addRow.append(el('span', 'rg-ins-lbl', 'Добавить:'));
+          addRow.append(rgBtn('＋ Условие', '', () => addCondChild(id)));
+          addRow.append(rgBtn('＋ ALL', '', () => addLogicChild(id, 'all')));
+          addRow.append(rgBtn('＋ ANY', '', () => addLogicChild(id, 'any')));
+          addRow.append(rgBtn('＋ NOT', '', () => addLogicChild(id, 'not')));
+        }
+        inspector.append(addRow);
+      }
+
+      const wrapRow = el('div', 'rg-ins-row');
+      wrapRow.append(el('span', 'rg-ins-lbl', 'Обернуть в:'));
+      wrapRow.append(rgBtn('ALL', '', () => wrapNode(id, 'all')));
+      wrapRow.append(rgBtn('ANY', '', () => wrapNode(id, 'any')));
+      wrapRow.append(rgBtn('NOT', '', () => wrapNode(id, 'not')));
+      inspector.append(wrapRow);
+
+      const delRow = el('div', 'rg-ins-row');
+      delRow.append(rgBtn('🗑 Удалить узел', 'danger-ghost', () => deleteNode(id)));
+      inspector.append(delRow);
+    }
+
+    rerender();
+  }
+
+  // Toggle wrapper mounted at every requirement host (view / click / open): a compact bar with a
+  // «🔗 Граф» button switches the SAME requirement object between the structured/raw builder and the
+  // node-graph editor. `currentValue` is kept live across edits so a mode switch never loses the value.
+  function mountRequirementEditor(host, initial, onChange) {
+    clear(host);
+    host.classList.add('req-editor');
+    const local = { graph: false };
+    let currentValue = initial ? JSON.parse(JSON.stringify(initial)) : null;
+
+    const bar = el('div', 'req-mode-bar');
+    bar.append(el('span', 'req-mode-lbl', 'Редактор условия'));
+    const gbtn = el('button', 'btn small req-graph-toggle', '🔗 Граф');
+    gbtn.type = 'button';
+    bar.append(gbtn);
+    const body = el('div', 'req-editor-body');
+    host.append(bar, body);
+
+    function change(val) { currentValue = val ? JSON.parse(JSON.stringify(val)) : null; onChange(val); }
+    function mount() {
+      gbtn.setAttribute('aria-pressed', local.graph ? 'true' : 'false');
+      clear(body);
+      if (local.graph) buildRequirementGraph(body, currentValue, change);
+      else buildRequirementBuilder(body, currentValue, change);
+    }
+    gbtn.onclick = () => { local.graph = !local.graph; mount(); };
+    mount();
   }
 
   // wire the per-slot view/click requirement builders from the active item (bulk-aware writes)
@@ -1164,6 +1642,203 @@
     return { kind: 'blank' }; // truly texture-less entity item (chest/bed/skull/banner/shield/...)
   }
 
+  // ================================================================== deepslate block renderer
+  // BLOCKS (resolver kind 'cube') are upgraded to a real 1.21.11 3D inventory render via deepslate's
+  // WebGL ItemRenderer, so stairs/slabs/fences/logs/etc. show their true shape, not a flat CSS cube.
+  // Everything here is OPTIONAL and lazy: the module loads on first use, one WebGL2 context + one
+  // ItemRenderer are reused for every block, results are cached per material as a PNG data URL, and
+  // ANY failure (module load, missing model, empty render) silently falls back to the CSS cube. The
+  // atlas is 2048x1888 (non-power-of-two) and deepslate calls generateMipmap, so a WebGL2 context is
+  // required (NPOT mipmaps are only valid under WebGL2). misode's data.min.json stores pixel UVs
+  // [x,y,w,h]; deepslate wants normalised [u0,v0,u1,v1], so we supply a custom TextureAtlasProvider.
+
+  let deepslateInit = null;              // Promise<ctx|null>, resolved once per session
+  const dsBlockJson = new Map();         // model path  -> raw json | null (sync-readable by provider)
+  const dsItemDefJson = new Map();       // item name   -> raw json | null
+  const dsBlockModelInst = new Map();    // model path  -> flattened deepslate BlockModel | null
+  const dsItemModelInst = new Map();     // item name   -> deepslate ItemModel | null
+  const blockRenderCache = new Map();    // material    -> PNG data URL | null (null = tried & failed)
+  const blockRenderPending = new Map();  // material    -> Promise<url|null> (dedupes concurrent renders)
+
+  function loadImageCors(url) {
+    return new Promise((resolve, reject) => {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.onload = () => resolve(im);
+      im.onerror = () => reject(new Error('image load failed: ' + url));
+      im.src = url;
+    });
+  }
+
+  // collect every block-model path referenced anywhere in a 1.21.4 item-model tree (type:model nodes),
+  // recursing through the select/condition/range_dispatch/composite dispatch containers.
+  function collectItemModelPaths(node, out) {
+    if (!node || typeof node !== 'object') return;
+    if (stripNs(node.type || '') === 'model' && typeof node.model === 'string') { out.push(stripNs(node.model)); return; }
+    const kids = [];
+    if (Array.isArray(node.cases)) node.cases.forEach((c) => kids.push(c && c.model));
+    if (node.fallback) kids.push(node.fallback);
+    if (node.on_true) kids.push(node.on_true);
+    if (node.on_false) kids.push(node.on_false);
+    if (Array.isArray(node.entries)) node.entries.forEach((e) => kids.push(e && e.model));
+    if (Array.isArray(node.models)) node.models.forEach((m) => kids.push(m));
+    kids.forEach((k) => collectItemModelPaths(k, out));
+  }
+
+  // fetch a block model + its whole parent chain into dsBlockJson (so the sync provider can read them)
+  async function ensureBlockChain(path, depth) {
+    depth = depth || 0;
+    if (depth > 16) return true;
+    if (dsBlockJson.has(path)) return dsBlockJson.get(path) != null;
+    const json = await fetchModelJson(path); // reuses the shared modelCache (mcasset.cloud, CORS *)
+    dsBlockJson.set(path, json || null);
+    if (!json) return false;
+    const parent = json.parent ? stripNs(json.parent) : '';
+    if (parent && !parent.startsWith('builtin/')) await ensureBlockChain(parent, depth + 1);
+    return true;
+  }
+
+  // resolve + fetch everything the renderer needs for one block material (item def + model chains)
+  async function prefetchBlockItem(name) {
+    if (!dsItemDefJson.has(name)) {
+      const def = await fetchItemDef(name); // reuses itemDefCache
+      dsItemDefJson.set(name, def || null);
+    }
+    const def = dsItemDefJson.get(name);
+    if (!def || !def.model) return false;
+    const paths = [];
+    collectItemModelPaths(def.model, paths);
+    if (!paths.length) return false;
+    let anyOk = false;
+    for (const p of paths) { if (await ensureBlockChain(p)) anyOk = true; }
+    return anyOk;
+  }
+
+  // load deepslate + the atlas once; wire the four synchronous resource providers ItemRenderer needs.
+  function initDeepslate() {
+    if (deepslateInit) return deepslateInit;
+    deepslateInit = (async () => {
+      const ds = await import(DEEPSLATE_URL);
+      const { Identifier, ItemStack, ItemRenderer, ItemModel, BlockModel, NbtString } = ds;
+      if (!Identifier || !ItemStack || !ItemRenderer || !ItemModel || !BlockModel || !NbtString) {
+        throw new Error('deepslate exports missing');
+      }
+      const [atlasImg, atlasData] = await Promise.all([
+        loadImageCors(ATLAS_PNG_URL),
+        fetch(ATLAS_DATA_URL).then((r) => { if (!r.ok) throw new Error('atlas data ' + r.status); return r.json(); }),
+      ]);
+      const AW = atlasImg.naturalWidth || atlasImg.width;
+      const AH = atlasImg.naturalHeight || atlasImg.height;
+      // atlas PNG -> ImageData (throws SecurityError if the image were CORS-tainted -> disables path)
+      const ac = document.createElement('canvas'); ac.width = AW; ac.height = AH;
+      const actx = ac.getContext('2d');
+      actx.drawImage(atlasImg, 0, 0);
+      const atlasImageData = actx.getImageData(0, 0, AW, AH);
+
+      const glCanvas = document.createElement('canvas');
+      glCanvas.width = DS_RENDER_PX; glCanvas.height = DS_RENDER_PX;
+      const gl = glCanvas.getContext('webgl2', {
+        alpha: true, premultipliedAlpha: false, antialias: false, preserveDrawingBuffer: true,
+      });
+      if (!gl) throw new Error('webgl2 unavailable');
+
+      // --- resource providers (all SYNCHRONOUS; backed by the prefetched sync caches above) ---
+      const atlasProvider = {
+        getTextureAtlas: () => atlasImageData,
+        getTextureUV: (id) => {
+          const px = atlasData[id.path] || atlasData[String(id).replace(/^minecraft:/, '')];
+          if (!px) return [0, 0, 16 / AW, 16 / AH];
+          const x = px[0], y = px[1], w = px[2];
+          let h = px[3];
+          if (h > w && h % w === 0) h = w; // vertical animation strip -> render first frame only
+          return [x / AW, y / AH, (x + w) / AW, (y + h) / AH];
+        },
+        getPixelSize: () => 1 / AW, // half-texel inset for anti-bleed; atlas is near-square so ~exact
+      };
+      const blockModelProvider = {
+        getBlockModel: (id) => {
+          const path = id.path;
+          if (dsBlockModelInst.has(path)) return dsBlockModelInst.get(path);
+          const json = dsBlockJson.get(path);
+          if (!json) { dsBlockModelInst.set(path, null); return null; }
+          let bm = null;
+          try { bm = BlockModel.fromJson(json); bm.flatten(blockModelProvider); } catch (e) { bm = null; }
+          dsBlockModelInst.set(path, bm);
+          return bm;
+        },
+      };
+      const itemModelProvider = {
+        getItemModel: (id) => {
+          const key = id.path;
+          if (dsItemModelInst.has(key)) return dsItemModelInst.get(key);
+          const def = dsItemDefJson.get(key);
+          const node = def && def.model;
+          let im = null;
+          if (node) { try { im = ItemModel.fromJson(node); } catch (e) { im = null; } }
+          dsItemModelInst.set(key, im);
+          return im;
+        },
+      };
+      // default item_model component = the item's own id (matches vanilla), so a bare ItemStack renders
+      const componentsProvider = {
+        getItemComponents: (id) => new Map([['minecraft:item_model', new NbtString(String(id))]]),
+      };
+      const resources = Object.assign({}, atlasProvider, blockModelProvider, itemModelProvider, componentsProvider);
+
+      let itemRenderer = null;                 // one renderer, reused (atlas texture uploaded once)
+      const guiCtx = { display_context: 'gui' };
+      const pixels = new Uint8Array(DS_RENDER_PX * DS_RENDER_PX * 4);
+
+      // draw an already-prefetched block to a data URL, or null if essentially nothing rendered
+      function drawToDataUrl(name) {
+        const item = new ItemStack(Identifier.create(name), 1);
+        gl.viewport(0, 0, DS_RENDER_PX, DS_RENDER_PX);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        if (!itemRenderer) itemRenderer = new ItemRenderer(gl, item, resources, guiCtx);
+        else itemRenderer.setItem(item, guiCtx);
+        itemRenderer.drawItem();
+        // validity guard: missing/empty meshes draw nothing -> treat as failure so we fall back
+        gl.readPixels(0, 0, DS_RENDER_PX, DS_RENDER_PX, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        let covered = 0;
+        for (let i = 3; i < pixels.length; i += 4) { if (pixels[i] > 12 && ++covered >= 12) break; }
+        if (covered < 12) return null;
+        return glCanvas.toDataURL('image/png');
+      }
+
+      return { drawToDataUrl };
+    })().catch((e) => {
+      console.warn('[AlexMenus] deepslate block renderer unavailable, using CSS cube fallback:', e && e.message);
+      return null;
+    });
+    return deepslateInit;
+  }
+
+  // public entry: resolve a block material to a cached PNG data URL (null if it can't be rendered)
+  function getBlockRender(name) {
+    if (blockRenderCache.has(name)) return Promise.resolve(blockRenderCache.get(name));
+    if (blockRenderPending.has(name)) return blockRenderPending.get(name);
+    const p = (async () => {
+      let url = null;
+      try {
+        const ctx = await initDeepslate();
+        if (ctx && await prefetchBlockItem(name)) url = ctx.drawToDataUrl(name);
+      } catch (e) { url = null; }
+      blockRenderCache.set(name, url);
+      blockRenderPending.delete(name);
+      return url;
+    })();
+    blockRenderPending.set(name, p);
+    return p;
+  }
+
+  function blockImg(url) {
+    const im = document.createElement('img');
+    im.className = 'block3d'; im.loading = 'eager'; im.alt = '';
+    im.src = url;
+    return im;
+  }
+
   // build a 3D CSS cube: top face, left = side, right = front (or side)
   function buildCube(top, side, front) {
     const cube = el('div', 'cube');
@@ -1209,13 +1884,16 @@
     }, 700);
   }
 
-  // a placeholder .ic-holder that resolves its icon lazily (grid) or immediately (mat-ic preview)
-  function makeIconHolder(material, sizePx, txtCls, lazy) {
+  // a placeholder .ic-holder that resolves its icon lazily (grid/picker) or immediately (mat-ic).
+  // `observer` overrides the shared grid observer (the material picker passes its own, rooted on its
+  // scroll container); omitted -> the grid's iconObserver, preserving all existing call sites.
+  function makeIconHolder(material, sizePx, txtCls, lazy, observer) {
     const holder = el('div', 'ic-holder');
     holder.style.setProperty('--sz', sizePx + 'px');
     holder.dataset.name = stripNs(String(material || '').toLowerCase()).replace(/\s+/g, '').trim();
     holder.dataset.txt = txtCls || 'cell-txt';
-    if (lazy && iconObserver) iconObserver.observe(holder);
+    const obs = observer || iconObserver;
+    if (lazy && obs) obs.observe(holder);
     else loadIcon(holder);
     return holder;
   }
@@ -1228,7 +1906,10 @@
 
     // fast-path (no fetch): most real items have a flat item/<name>.png texture
     const img = document.createElement('img');
-    img.className = 'flat'; img.loading = 'lazy'; img.alt = '';
+    // eager, not lazy: the holder is only loaded once its IntersectionObserver says it's visible, so the
+    // native lazy attribute is redundant AND can wedge the probe (never firing onload/onerror, so the
+    // resolver never advances to the block/cube path) in some layout/compositing situations.
+    img.className = 'flat'; img.loading = 'eager'; img.alt = '';
     img.onload = () => { iconResultCache.set(name, { kind: 'flat', tex: 'item/' + name }); };
     img.onerror = () => {
       img.remove();
@@ -1245,12 +1926,26 @@
     clear(holder);
     if (res.kind === 'flat') {
       const im = document.createElement('img');
-      im.className = 'flat'; im.loading = 'lazy'; im.alt = '';
+      im.className = 'flat'; im.loading = 'eager'; im.alt = '';
       im.onerror = () => { im.remove(); if (!holder.firstChild) holder.append(el('span', txtCls, shortMat(name))); };
       im.src = texUrl(res.tex);
       holder.append(im);
     } else if (res.kind === 'cube') {
-      holder.append(buildCube(res.top, res.side, res.front));
+      // BLOCK: prefer an exact deepslate 3D inventory render; the CSS cube shows instantly and stays
+      // as the permanent fallback if deepslate is unavailable or can't render this particular block.
+      const cached = blockRenderCache.get(name);
+      if (typeof cached === 'string') {
+        holder.append(blockImg(cached));
+      } else {
+        holder.append(buildCube(res.top, res.side, res.front));
+        if (cached !== null) { // undefined = not tried yet; null = tried & failed (keep the cube)
+          getBlockRender(name).then((url) => {
+            if (url && holder.isConnected && holder.dataset.name === name) {
+              clear(holder); holder.append(blockImg(url));
+            }
+          });
+        }
+      }
     } else {
       // blank: only truly-unresolvable entity items (chest/bed/head/banner/shield/conduit)
       holder.append(el('span', txtCls, shortMat(name)));
@@ -1555,10 +2250,10 @@
     toast('Дубликат: «' + id + '»', 'ok');
   }
 
-  function deleteMenu() {
+  async function deleteMenu() {
     const m = current();
     if (!m) return;
-    if (!window.confirm('Удалить меню «' + m.id + '»? Действие применится после сохранения.')) return;
+    if (!(await modalConfirm('Удалить меню', 'Удалить меню «' + m.id + '»? Действие применится после сохранения.'))) return;
     state.menus.splice(state.sel, 1);
     state.sel = state.menus.length ? Math.max(0, state.sel - 1) : -1;
     resetSelection();
@@ -1668,12 +2363,200 @@
     ta.remove();
   }
 
+  // ================================================================== MATERIAL PICKER
+  // Full 1.21.11 item/block list from PrismarineJS minecraft-data. Cached in-memory + localStorage.
+  // On fetch failure the picker degrades to a note ("введите вручную") and the manual material text
+  // field stays usable. Selecting a cell assigns an UPPERCASE Bukkit material (minecraft-data `name`
+  // is lowercase snake_case) to the active slot + every selected slot (bulk), creating items as needed.
+  const MATERIALS_URL = 'https://raw.githubusercontent.com/PrismarineJS/minecraft-data/master/data/pc/1.21.11/items.json';
+  const MATERIALS_STORE_KEY = 'am_materials_1_21_11';
+  const PICKER_CAP = 320;          // cap rendered cells; the search box narrows the full list
+  let materialsCache = null;       // [{ name, displayName }] once loaded
+  let materialsPromise = null;     // in-flight fetch (dedupe)
+  let pickerObserver = null;       // lazy-icon observer rooted on the picker's scroll container
+  let mpSearchTimer = null;        // debounce for the search box
+
+  function loadMaterials() {
+    if (materialsCache) return Promise.resolve(materialsCache);
+    try {
+      const raw = localStorage.getItem(MATERIALS_STORE_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length) { materialsCache = arr; return Promise.resolve(arr); }
+      }
+    } catch (e) { /* private mode / corrupt cache -> refetch */ }
+    if (materialsPromise) return materialsPromise;
+    materialsPromise = fetch(MATERIALS_URL)
+      .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then((arr) => {
+        const list = (Array.isArray(arr) ? arr : [])
+          .map((it) => ({ name: String(it.name || ''), displayName: String(it.displayName || it.name || '') }))
+          .filter((it) => it.name);
+        materialsCache = list;
+        try { localStorage.setItem(MATERIALS_STORE_KEY, JSON.stringify(list)); } catch (e) { /* quota */ }
+        return list;
+      })
+      .catch((e) => { materialsPromise = null; throw e; });
+    return materialsPromise;
+  }
+
+  function openMaterialPicker() {
+    const m = current();
+    if (!m || state.active == null) { toast('Сначала выберите слот', 'err'); return; }
+    if (pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }
+    const search = $('mp-search');
+    search.value = '';
+    clear($('mp-grid'));
+    $('mp-note').hidden = true;
+    $('mp-loading').hidden = !!materialsCache;
+    $('material-modal').hidden = false;
+    search.focus();
+    loadMaterials().then(() => {
+      $('mp-loading').hidden = true;
+      renderPickerGrid('');
+    }).catch((e) => {
+      $('mp-loading').hidden = true;
+      // Do NOT cache an empty list — that would make loadMaterials() short-circuit forever with no retry.
+      // renderPickerGrid('') shows the "недоступны" note when the list is empty; cache stays null so a reopen re-fetches.
+      renderPickerGrid('');
+      toast('Список материалов недоступен (' + (e && e.message ? e.message : 'сеть') + '). Введите материал вручную.', 'err');
+    });
+  }
+
+  function closeMaterialPicker() {
+    $('material-modal').hidden = true;
+    if (pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }
+  }
+
+  function renderPickerGrid(query) {
+    const grid = $('mp-grid');
+    const scrollEl = $('mp-scroll');
+    clear(grid);
+    if (pickerObserver) pickerObserver.disconnect();
+    pickerObserver = ('IntersectionObserver' in window)
+      ? new IntersectionObserver((entries) => {
+          entries.forEach((e) => { if (e.isIntersecting) { pickerObserver.unobserve(e.target); loadIcon(e.target); } });
+        }, { root: scrollEl, rootMargin: '250px' })
+      : null;
+
+    const q = (query || '').trim().toLowerCase();
+    const list = materialsCache || [];
+    const filtered = q
+      ? list.filter((it) => it.name.toLowerCase().indexOf(q) !== -1 || it.displayName.toLowerCase().indexOf(q) !== -1)
+      : list;
+    const shown = filtered.slice(0, PICKER_CAP);
+    shown.forEach((it) => grid.append(buildPickerCell(it)));
+
+    const note = $('mp-note');
+    if (!list.length) note.textContent = 'Данные о материалах недоступны — введите материал вручную в поле «Материал».';
+    else if (filtered.length > shown.length) note.textContent = 'Найдено ' + filtered.length + ', показаны первые ' + PICKER_CAP + ' — уточните поиск.';
+    else note.textContent = filtered.length + (filtered.length === 1 ? ' совпадение' : ' совпадений');
+    note.hidden = false;
+
+    if (pickerObserver) scheduleIconFallback(scrollEl);
+    else grid.querySelectorAll('.ic-holder').forEach(loadIcon);
+  }
+
+  function buildPickerCell(it) {
+    const bukkit = it.name.toUpperCase();   // diamond_sword -> DIAMOND_SWORD
+    const cell = el('button', 'mp-cell');
+    cell.type = 'button';
+    cell.title = bukkit;
+    cell.append(makeIconHolder(it.name, 34, 'mi-txt', true, pickerObserver));
+    cell.append(el('span', 'mp-name', it.displayName));
+    cell.onclick = () => choosePickerMaterial(bukkit);
+    return cell;
+  }
+
+  function choosePickerMaterial(mat) {
+    assignMaterial(mat, targetSlots());   // active slot + selection (bulk), creating items as needed
+    closeMaterialPicker();
+    renderGrid();
+    renderProps();
+    toast('Материал: ' + mat, 'ok');
+  }
+
   // ================================================================== TOASTS
   function toast(msg, kind) {
     const t = el('div', 'toast' + (kind ? ' ' + kind : ''), msg);
     $('toasts').append(t);
     setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 200); }, 3200);
   }
+
+  // ================================================================== MODALS (prompt/confirm/alert)
+  // Themed in-page replacements for window.prompt/confirm/alert. Each returns a Promise. The overlay
+  // reuses the .overlay/.modal styling; Esc/backdrop = cancel, Enter = confirm, input is focused.
+  // These modals are created dynamically (after wireStaticUi), so they own their Esc/backdrop wiring:
+  // the keydown listener is registered in the CAPTURE phase and stopPropagation()s, so the global
+  // Esc-closes-all-overlays handler never fires for them (no dangling unresolved promise).
+  function openModal(opts) {
+    return new Promise((resolve) => {
+      const kind = opts.kind;                       // 'prompt' | 'confirm' | 'alert'
+      const cancelVal = kind === 'confirm' ? false : (kind === 'alert' ? undefined : null);
+
+      const overlay = el('div', 'overlay');
+      const modal = el('div', 'modal');
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      modal.append(el('h2', null, opts.title || ''));
+
+      let input = null;
+      if (kind === 'prompt') {
+        const field = el('label', 'field');
+        if (opts.label) field.append(el('span', 'modal-label', opts.label));
+        input = document.createElement('input');
+        input.type = 'text'; input.className = 'in'; input.autocomplete = 'off';
+        if (opts.value != null) input.value = String(opts.value);
+        if (opts.placeholder) input.placeholder = opts.placeholder;
+        field.append(input);
+        modal.append(field);
+      } else if (opts.message) {
+        modal.append(el('p', 'muted', opts.message));
+      }
+
+      let settled = false;
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener('keydown', onKey, true);
+        overlay.remove();
+        resolve(val);
+      };
+
+      const actions = el('div', 'modal-actions');
+      if (kind !== 'alert') {
+        const cancel = el('button', 'btn', opts.cancelText || 'Отмена');
+        cancel.type = 'button';
+        cancel.onclick = () => finish(cancelVal);
+        actions.append(cancel);
+      }
+      const ok = el('button', 'btn primary', opts.okText || 'OK');
+      ok.type = 'button';
+      ok.onclick = () => finish(kind === 'prompt' ? (input ? input.value : '') : (kind === 'confirm' ? true : undefined));
+      actions.append(ok);
+      modal.append(actions);
+      overlay.append(modal);
+
+      overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) finish(cancelVal); });
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); finish(cancelVal); }
+        else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); ok.click(); }
+      };
+      document.addEventListener('keydown', onKey, true);
+
+      document.body.append(overlay);
+      if (input) { input.focus(); input.select(); } else ok.focus();
+    });
+  }
+  // -> entered string, or null on cancel/backdrop/Esc
+  function modalPrompt(title, o) {
+    o = o || {};
+    return openModal({ kind: 'prompt', title, label: o.label, value: o.value, placeholder: o.placeholder });
+  }
+  // -> boolean
+  function modalConfirm(title, message) { return openModal({ kind: 'confirm', title, message }); }
+  // -> void
+  function modalAlert(title, message) { return openModal({ kind: 'alert', title, message }); }
 
   // ================================================================== helpers
   function rowsOf(obj) {
@@ -1702,6 +2585,15 @@
     $('del-menu-btn').onclick = deleteMenu;
     $('clear-slot-btn').onclick = clearSlot;
 
+    // material picker (both entry points: the button beside the material field + the empty-slot button)
+    $('f-material-pick').onclick = openMaterialPicker;
+    $('f-material-pick-big').onclick = openMaterialPicker;
+    $('mp-close').onclick = closeMaterialPicker;
+    $('mp-search').addEventListener('input', () => {
+      clearTimeout(mpSearchTimer);
+      mpSearchTimer = setTimeout(() => renderPickerGrid($('mp-search').value), 110);
+    });
+
     // bulk clicks: any field edit inside #f-clicks propagates to all selected slots
     $('f-clicks').addEventListener('input', () => { if (targetSlots().length > 1) propagateClicks(); });
     $('f-clicks').addEventListener('change', () => { if (targetSlots().length > 1) propagateClicks(); });
@@ -1729,12 +2621,18 @@
 
     // close overlays on backdrop click
     document.querySelectorAll('.overlay').forEach((ov) => {
-      ov.addEventListener('mousedown', (e) => { if (e.target === ov) ov.hidden = true; });
+      ov.addEventListener('mousedown', (e) => {
+        if (e.target === ov) {
+          ov.hidden = true;
+          if (ov.id === 'material-modal' && pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }
+        }
+      });
     });
     // Esc closes overlays and the context menu
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         document.querySelectorAll('.overlay').forEach((o) => (o.hidden = true));
+        if (pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }  // don't leak the picker's observer
         hideContextMenu();
       }
     });
