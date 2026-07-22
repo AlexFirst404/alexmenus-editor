@@ -300,6 +300,13 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .ms-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; padding:12px 0 4px; }
 .ms-grid .ms-wide { grid-column:1 / -1; }
 .ms-grid .ms-help { grid-column:1 / -1; }
+/* nested key-groups inside menu-settings (open-item / open-animation) */
+.ms-subgrid {
+  display:grid; grid-template-columns:1fr 1fr; gap:9px 12px;
+  margin-top:7px; padding:9px 10px;
+  background:var(--panel-2); border:1px solid var(--border); border-radius:var(--r-sm);
+}
+.ms-subgrid .ms-sub-full { grid-column:1 / -1; }
 
 /* ============ navigation graph ============ */
 .graph-wrap { flex:1 1 auto; position:relative; min-height:0; overflow:hidden; background:var(--panel); }

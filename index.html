@@ -86,6 +86,66 @@
             <input type="checkbox" id="ms-show-help" checked />
             <span>Показывать в /help (show-in-help)</span>
           </label>
+
+          <label class="field">
+            <span class="lbl">Живое обновление (тиков), 0 = выкл</span>
+            <input type="number" id="ms-update-interval" class="in" min="0" step="1" placeholder="0" />
+          </label>
+          <label class="field">
+            <span class="lbl">Аргументы команды (через запятую)</span>
+            <input type="text" id="ms-args" class="in" placeholder="page, category" />
+          </label>
+
+          <div class="field ms-wide">
+            <span class="lbl">Предмет-открывашка (open-item)</span>
+            <div class="ms-subgrid">
+              <div class="mat-row ms-sub-full">
+                <span class="mat-ic" id="ms-oi-ic" aria-hidden="true"></span>
+                <input type="text" id="ms-oi-material" class="in" placeholder="COMPASS (пусто — выключить)" />
+                <button class="btn small" id="ms-oi-pick" type="button" title="Выбрать материал из списка">Выбрать…</button>
+              </div>
+              <label class="field ms-sub-full">
+                <span class="lbl">Имя (name, MiniMessage)</span>
+                <input type="text" id="ms-oi-name" class="in" placeholder="<gold>Меню" />
+              </label>
+              <label class="field">
+                <span class="lbl">custom-model-data (cmd)</span>
+                <input type="text" id="ms-oi-cmd" class="in" placeholder="напр. 101" />
+              </label>
+              <label class="field">
+                <span class="lbl">Слот (-1..8)</span>
+                <input type="number" id="ms-oi-slot" class="in" min="-1" max="8" step="1" placeholder="-1" />
+              </label>
+              <label class="check ms-sub-full">
+                <input type="checkbox" id="ms-oi-join" />
+                <span>Выдавать при входе (give-on-join)</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="field ms-wide">
+            <span class="lbl">Анимация открытия (open-animation)</span>
+            <div class="ms-subgrid">
+              <label class="field">
+                <span class="lbl">Тип</span>
+                <select id="ms-oa-type" class="in">
+                  <option value="none">нет</option>
+                  <option value="sweep">sweep — по слотам</option>
+                  <option value="rows">rows — по рядам</option>
+                  <option value="random">random — вразнобой</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="lbl">Интервал (тиков)</span>
+                <input type="number" id="ms-oa-interval" class="in" min="1" step="1" placeholder="2" />
+              </label>
+              <label class="field ms-sub-full">
+                <span class="lbl">Звук шага (sound)</span>
+                <input type="text" id="ms-oa-sound" class="in" placeholder="minecraft:ui.button.click" />
+              </label>
+            </div>
+          </div>
+
           <div class="field ms-wide req-section">
             <span class="lbl">Требование открытия (open-requirement)</span>
             <div class="req-block" id="req-open"></div>

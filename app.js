@@ -80,9 +80,11 @@
 
   // action type -> Russian label (order = <select> order)
   const ACTION_TYPES = [
-    ['run_command', 'Команда'], ['message', 'Сообщение'], ['open_menu', 'Открыть меню'],
-    ['sound', 'Звук'], ['give_item', 'Выдать предмет'], ['refresh', 'Обновить'],
-    ['close', 'Закрыть'], ['back', 'Назад'], ['conditional', 'Условие (JSON)']
+    ['run_command', 'Команда'], ['message', 'Сообщение'], ['actionbar', 'Actionbar'],
+    ['title', 'Заголовок (title)'], ['open_menu', 'Открыть меню'], ['connect', 'Сервер (connect)'],
+    ['sound', 'Звук'], ['give_item', 'Выдать предмет'],
+    ['give_permission', 'Выдать право'], ['take_permission', 'Забрать право'],
+    ['refresh', 'Обновить'], ['close', 'Закрыть'], ['back', 'Назад'], ['conditional', 'Условие (JSON)']
   ];
 
   // requirement types the STRUCTURED builder understands; composites (all/any/not) and anything
@@ -350,6 +352,69 @@
     const help = $('ms-show-help');
     help.checked = m.obj['show-in-help'] !== false;
     help.onchange = () => { if (help.checked) delete m.obj['show-in-help']; else m.obj['show-in-help'] = false; };
+
+    // update-interval (live refresh, ticks) — 0 / absent = off, so omit the key at 0
+    const upd = $('ms-update-interval');
+    upd.value = (m.obj['update-interval'] != null) ? String(m.obj['update-interval']) : '';
+    upd.oninput = () => {
+      const v = parseInt(upd.value, 10);
+      if (isNaN(v) || v <= 0) delete m.obj['update-interval']; else m.obj['update-interval'] = v;
+    };
+
+    // args (named command arguments) — comma/space list <-> string array; empty omits the key
+    const args = $('ms-args');
+    args.value = Array.isArray(m.obj.args) ? m.obj.args.join(', ') : (m.obj.args != null ? String(m.obj.args) : '');
+    args.oninput = () => {
+      const list = args.value.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+      if (list.length) m.obj.args = list; else delete m.obj.args;
+    };
+
+    // open-item {material, name, cmd, slot, give-on-join} — the whole key is omitted when material is empty
+    const oi = (m.obj['open-item'] && typeof m.obj['open-item'] === 'object') ? m.obj['open-item'] : {};
+    const oiMat = $('ms-oi-material'), oiName = $('ms-oi-name'), oiCmd = $('ms-oi-cmd'),
+          oiSlot = $('ms-oi-slot'), oiJoin = $('ms-oi-join');
+    oiMat.value = oi.material != null ? String(oi.material) : '';
+    oiName.value = oi.name != null ? String(oi.name) : '';
+    oiCmd.value = oi.cmd != null ? String(oi.cmd) : '';
+    oiSlot.value = oi.slot != null ? String(oi.slot) : '';
+    oiJoin.checked = oi['give-on-join'] === true;
+    setMatIconEl($('ms-oi-ic'), oi.material);
+    const syncOpenItem = () => {
+      const mat = oiMat.value.trim();
+      if (!mat) { delete m.obj['open-item']; return; }
+      const spec = { material: mat };
+      const nm = oiName.value.trim(); if (nm) spec.name = nm;
+      const cd = oiCmd.value.trim(); if (cd) spec.cmd = cd;
+      const sl = parseInt(oiSlot.value, 10); if (!isNaN(sl)) spec.slot = sl;
+      if (oiJoin.checked) spec['give-on-join'] = true;
+      m.obj['open-item'] = spec;
+    };
+    oiMat.oninput = () => { syncOpenItem(); setMatIconEl($('ms-oi-ic'), oiMat.value.trim()); };
+    oiName.oninput = syncOpenItem;
+    oiCmd.oninput = syncOpenItem;
+    oiSlot.oninput = syncOpenItem;
+    oiJoin.onchange = syncOpenItem;
+    $('ms-oi-pick').onclick = () => openMaterialPickerFor((mat) => {
+      oiMat.value = mat; syncOpenItem(); setMatIconEl($('ms-oi-ic'), mat);
+    });
+
+    // open-animation {type, interval, sound} — omitted when type is none/empty
+    const oa = (m.obj['open-animation'] && typeof m.obj['open-animation'] === 'object') ? m.obj['open-animation'] : {};
+    const oaType = $('ms-oa-type'), oaInt = $('ms-oa-interval'), oaSound = $('ms-oa-sound');
+    oaType.value = normalizeOaType(oa.type);
+    oaInt.value = oa.interval != null ? String(oa.interval) : '';
+    oaSound.value = oa.sound != null ? String(oa.sound) : '';
+    const syncOpenAnim = () => {
+      const t = oaType.value;
+      if (!t || t === 'none') { delete m.obj['open-animation']; return; }
+      const spec = { type: t };
+      const iv = parseInt(oaInt.value, 10); if (!isNaN(iv) && iv >= 1) spec.interval = iv;
+      const snd = oaSound.value.trim(); if (snd) spec.sound = snd;
+      m.obj['open-animation'] = spec;
+    };
+    oaType.onchange = syncOpenAnim;
+    oaInt.oninput = syncOpenAnim;
+    oaSound.oninput = syncOpenAnim;
 
     // open-requirement (block: require + deny/success actions) — top-level menu key
     buildReqBlock($('req-open'),
@@ -639,9 +704,14 @@
     switch (type) {
       case 'run_command': return { type, command: '', as: 'player' };
       case 'message': return { type, text: '' };
+      case 'actionbar': return { type, text: '' };
+      case 'title': return { type, title: '', subtitle: '', 'fade-in': 10, stay: 40, 'fade-out': 10 };
       case 'open_menu': return { type, menu: '' };
+      case 'connect': return { type, server: '' };
       case 'sound': return { type, sound: '' };
       case 'give_item': return { type, material: 'STONE', amount: 1 };
+      case 'give_permission': return { type, permission: '' };
+      case 'take_permission': return { type, permission: '' };
       case 'conditional': return { type, requirement: '', then: [], else: [] };
       default: return { type }; // refresh, close, back
     }
@@ -656,10 +726,24 @@
         [['player', 'игрок'], ['console', 'консоль']], (v) => { a.as = v; }));
     } else if (t === 'message') {
       box.append(textField('Текст (MiniMessage)', a.text, (v) => { a.text = v; }));
+    } else if (t === 'actionbar') {
+      box.append(textField('Текст (MiniMessage)', a.text, (v) => { a.text = v; }));
+    } else if (t === 'title') {
+      box.append(textField('Заголовок (title)', a.title, (v) => { a.title = v; }));
+      box.append(textField('Подзаголовок (subtitle)', a.subtitle, (v) => { a.subtitle = v; }));
+      const line = el('div', 'inline');
+      line.append(numField('Появл. (fade-in)', a['fade-in'], (v) => { a['fade-in'] = v; }));
+      line.append(numField('Показ (stay)', a.stay, (v) => { a.stay = v; }));
+      line.append(numField('Исчез. (fade-out)', a['fade-out'], (v) => { a['fade-out'] = v; }));
+      box.append(line);
     } else if (t === 'open_menu') {
       box.append(textField('ID меню', a.menu, (v) => { a.menu = v; }));
+    } else if (t === 'connect') {
+      box.append(textField('Сервер (Bungee/Velocity)', a.server, (v) => { a.server = v; }));
     } else if (t === 'sound') {
       box.append(textField('Звук', a.sound, (v) => { a.sound = v; }));
+    } else if (t === 'give_permission' || t === 'take_permission') {
+      box.append(textField('Право (permission)', a.permission, (v) => { a.permission = v; }));
     } else if (t === 'give_item') {
       const line = el('div', 'inline');
       line.append(textField('Материал', a.material, (v) => { a.material = v; }));
@@ -723,6 +807,14 @@
   function setOrDel(obj, key, val) {
     if (val == null || String(val).trim() === '') delete obj[key];
     else obj[key] = val;
+  }
+  // map a stored open-animation type (incl. plugin aliases) onto a <select> option value
+  function normalizeOaType(raw) {
+    const s = String(raw == null ? '' : raw).trim().toLowerCase();
+    if (s === 'sweep' || s === 'slots' || s === 'slot') return 'sweep';
+    if (s === 'rows' || s === 'row') return 'rows';
+    if (s === 'random' || s === 'shuffle') return 'random';
+    return 'none';
   }
 
   // ================================================================== BULK-EDIT helpers
@@ -2084,12 +2176,14 @@
     }
   }
 
-  // props material preview (small): same resolver, rendered immediately
-  function setMatIcon(material) {
-    const holder = $('mat-ic');
+  // small material preview into a given holder (same resolver, rendered immediately)
+  function setMatIconEl(holder, material) {
+    if (!holder) return;
     clear(holder);
     if (material && String(material).trim()) holder.append(makeIconHolder(material, 28, 'mi-txt', false));
   }
+  // props material preview (small): same resolver, rendered immediately
+  function setMatIcon(material) { setMatIconEl($('mat-ic'), material); }
 
   // ================================================================== VIEW MODES (raw / graph)
   // raw and graph are mutually exclusive; both replace the center+right area.
@@ -2511,6 +2605,7 @@
   let materialsPromise = null;     // in-flight fetch (dedupe)
   let pickerObserver = null;       // lazy-icon observer rooted on the picker's scroll container
   let mpSearchTimer = null;        // debounce for the search box
+  let pickerOnChoose = null;       // when set, a picked material is passed here instead of assigned to slots
 
   function loadMaterials() {
     if (materialsCache) return Promise.resolve(materialsCache);
@@ -2536,9 +2631,21 @@
     return materialsPromise;
   }
 
+  // slot entry point (wired to the material-field + empty-slot buttons): picks assign to the selection
   function openMaterialPicker() {
     const m = current();
     if (!m || state.active == null) { toast('Сначала выберите слот', 'err'); return; }
+    pickerOnChoose = null;
+    showMaterialPicker();
+  }
+  // open the picker for a non-slot target (e.g. the menu open-item material); `cb(mat)` gets the choice
+  function openMaterialPickerFor(cb) {
+    if (!current()) { toast('Нет выбранного меню', 'err'); return; }
+    pickerOnChoose = cb;
+    showMaterialPicker();
+  }
+  // shared picker open/reset + material-list load (used by both entry points)
+  function showMaterialPicker() {
     if (pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }
     const search = $('mp-search');
     search.value = '';
@@ -2561,6 +2668,7 @@
 
   function closeMaterialPicker() {
     $('material-modal').hidden = true;
+    pickerOnChoose = null;
     if (pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }
   }
 
@@ -2605,6 +2713,8 @@
   }
 
   function choosePickerMaterial(mat) {
+    const cb = pickerOnChoose;
+    if (cb) { closeMaterialPicker(); cb(mat); toast('Материал: ' + mat, 'ok'); return; }
     assignMaterial(mat, targetSlots());   // active slot + selection (bulk), creating items as needed
     closeMaterialPicker();
     renderGrid();
