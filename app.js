@@ -25,8 +25,10 @@
   const itemDefCache = new Map(); // item name -> Promise<json|null>   (1.21.4 item-definitions)
   const BUNDLE_VERSION = 1;
 
-  // Paste-service Worker base URL. Deliberately NOT hardcoded in this (public) source — each browser
-  // supplies its own: `w=` in the link, else a value saved in localStorage, else asked once and saved.
+  // Paste-service Worker base URL. The default is the shared public paste worker on a NEUTRAL subdomain
+  // (no account handle), so the editor is zero-config. An explicit `?w=` in the link overrides it; forks
+  // that blank DEFAULT_WORKER fall back to a saved value or a one-time prompt.
+  const DEFAULT_WORKER = 'https://alexmenus-paste.alexmenus.workers.dev';
   const WORKER_STORE_KEY = 'am_worker';
 
   function storedWorker() {
@@ -44,10 +46,13 @@
     const inp = window.prompt(msg, storedWorker() || 'https://');
     return inp == null ? '' : rememberWorker(inp);
   }
-  // Resolve the Worker for this session: explicit `w=` wins (and is remembered), else the saved one, else ask.
+  // Resolve the Worker for this session: an explicit `?w=` wins (and is remembered); otherwise the baked
+  // default is used (zero-config — and it takes precedence over any stale saved value, e.g. an old worker
+  // URL a tester typed before the default existed). Forks that blank DEFAULT_WORKER fall back to storage/prompt.
   function resolveWorker(fromParam) {
     const w = (fromParam || '').trim().replace(/\/+$/, '');
     if (w) return rememberWorker(w);
+    if (DEFAULT_WORKER) return DEFAULT_WORKER;
     return storedWorker() || askWorker();
   }
 
