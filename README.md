@@ -9,6 +9,8 @@
 ## Скачать
 Плагин: **[Releases](../../releases)** → `AlexMenus-<версия>.jar` → положи в `plugins/`.
 
+**📖 Документация:** **[Wiki](wiki/Home.md)** — меню, условия (все типы/форматы), действия, интеграции (LuckPerms / PlaceholderAPI / MyCommand), примеры.
+
 ## Скриншоты
 > Скриншоты интерфейса добавляются. Пока проще всего посмотреть редактор **вживую**: запусти `/am editor`
 > на сервере и открой ссылку (или подставь свой paste-код к адресу редактора).
@@ -23,8 +25,9 @@
 - **Requirements-движок** (view/click/open) — см. ниже.
 - **Действия** вкл. экономику Vault (`give_money`/`take_money`), опыт, `broadcast`, `sound`, и модификаторы `chance`/`delay`.
 - **`/am reload`** перезагружает плагин целиком.
-- **Редактор:** мультивыделение слотов, контекстное меню (ПКМ), 3D-иконки блоков, **панель requirements**,
-  **граф** навигации, панель «Настройки меню».
+- **Редактор:** **пикер всех блоков/предметов 1.21.11** (поиск+иконки), **точные иконки как в майне**
+  (блоки — 3D-рендер vanilla через deepslate), **node-граф условий**, панель requirements (view/click/open),
+  граф навигации, свои модалки/чекбоксы, мультивыделение, контекстное меню (ПКМ).
 
 ## Requirements-движок
 Три места для условий:
@@ -42,23 +45,22 @@ click-requirement:
     - type: message
       text: "<red>Недостаточно денег"
 ```
-Типы: `permission`, `placeholder` (`== != contains regex > < >= <=` и др.), `money` (Vault), `has_item`,
-`exp` (очки/уровни), композиты `all`/`any`/`not`, флаг `negate`. В редакторе всё это — визуальными билдерами.
+Типы: `permission`, `placeholder` (`== != contains regex > < >= <=` и др.; **обе стороны** через PAPI),
+`money` (Vault), `has_item`, `exp` (очки/уровни), композиты `all`/`any`/`not`, флаг `negate`.
+В редакторе — визуальными билдерами, **node-графом** из узлов, или raw-YAML.
 
 ## Действия
 `run_command` · `message` · `broadcast` · `open_menu` · `refresh` · `back` · `close` · `sound` · `give_item` ·
 `give_money`/`take_money` (Vault) · `give_exp`/`take_exp` · `conditional`. На любом действии — `chance: 0–100`
 и `delay: <тики>`.
 
-## Настройка (один раз, ~10 мин)
-1. **Paste-сервис (Cloudflare Worker, бесплатно):** разверни воркер из [`cloudflare-worker/`](cloudflare-worker/).
-2. **`plugins/AlexMenus/config.yml`:**
-   ```yaml
-   editor:
-     worker-url: "https://alexmenus-paste.<твой-акк>.workers.dev"
-     url: "https://<твой-акк>.github.io/alexmenus-editor/"
-   ```
-3. `/reload`.
+## Настройка
+**Ничего настраивать не надо** — `/am editor` работает из коробки (общий публичный paste-воркер по умолчанию).
+Хочешь свой воркер — разверни его из [`cloudflare-worker/`](cloudflare-worker/) и впиши адрес в `config.yml`:
+```yaml
+editor:
+  worker-url: ""   # пусто = общий публичный воркер; или впиши адрес своего
+```
 
 ## Как пользоваться
 ```
