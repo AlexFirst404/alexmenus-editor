@@ -1,0 +1,9 @@
+name = "alexmenus-paste"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# The KV store that holds pasted bundles. Create it once, then paste its id below.
+#   wrangler kv namespace create PASTES
+[[kv_namespaces]]
+binding = "PASTES"
+id = "PUT_YOUR_KV_NAMESPACE_ID_HERE"

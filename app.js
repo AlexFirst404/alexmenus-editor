@@ -1,8 +1,8 @@
 /* AlexMenus web editor — vanilla JS SPA (js-yaml v4 is the only external dep).
  *
  * DATA FLOW
- *   load:  #<code>            (bare, clean link)  -> worker = DEFAULT_WORKER
- *          #k=<code>&w=<url>  (legacy, back-compat) -> worker from w=
+ *   load:  #<code>            (bare, clean link)  -> worker from localStorage (asked once per browser)
+ *          #k=<code>&w=<url>  (legacy, back-compat) -> worker from w= (also remembered)
  *          -> GET <w>/<k> -> bundle {v,menus:[{id,yaml}]}
  *          -> jsyaml.load(each yaml) -> plain JS objects held in state.menus[i].obj
  *   edit:  the structured UI (grid + slot editor) and the raw-YAML textarea mutate obj.
@@ -25,8 +25,31 @@
   const itemDefCache = new Map(); // item name -> Promise<json|null>   (1.21.4 item-definitions)
   const BUNDLE_VERSION = 1;
 
-  // Default paste-service Worker, used when the link is the clean `#<code>` form (no w=).
-  const DEFAULT_WORKER = 'https://alexmenus-paste.alextorx2020.workers.dev';
+  // Paste-service Worker base URL. Deliberately NOT hardcoded in this (public) source — each browser
+  // supplies its own: `w=` in the link, else a value saved in localStorage, else asked once and saved.
+  const WORKER_STORE_KEY = 'am_worker';
+
+  function storedWorker() {
+    try { return (localStorage.getItem(WORKER_STORE_KEY) || '').trim().replace(/\/+$/, ''); }
+    catch (e) { return ''; }
+  }
+  function rememberWorker(url) {
+    const clean = (url || '').trim().replace(/\/+$/, '');
+    try { if (clean) localStorage.setItem(WORKER_STORE_KEY, clean); } catch (e) { /* private mode */ }
+    return clean;
+  }
+  function askWorker() {
+    const msg = 'Адрес paste-воркера (из config.yml плагина, поле editor.worker-url),\n'
+              + 'напр. https://alexmenus-paste.<акк>.workers.dev';
+    const inp = window.prompt(msg, storedWorker() || 'https://');
+    return inp == null ? '' : rememberWorker(inp);
+  }
+  // Resolve the Worker for this session: explicit `w=` wins (and is remembered), else the saved one, else ask.
+  function resolveWorker(fromParam) {
+    const w = (fromParam || '').trim().replace(/\/+$/, '');
+    if (w) return rememberWorker(w);
+    return storedWorker() || askWorker();
+  }
 
   // click-kind id -> Russian label
   const CLICK_KINDS = [
@@ -50,7 +73,7 @@
 
   // ------------------------------------------------------------------ state
   const state = {
-    workerBase: '',        // Worker base URL (from hash `w`, or DEFAULT_WORKER)
+    workerBase: '',        // Worker base URL (from hash `w=`, or saved in localStorage)
     code: '',              // paste code (from hash)
     menus: [],             // [{ id, obj }]  — obj = parsed menu object
     sel: -1,               // index of the selected menu
@@ -91,26 +114,29 @@
       return;
     }
     state.code = hash.k;
-    state.workerBase = hash.w;
+    state.workerBase = resolveWorker(hash.w);
+    if (!state.workerBase) {   // no worker configured for this browser -> can't load; explain
+      show('empty-state');
+      return;
+    }
     loadBundle();
   }
 
-  // Parse location.hash. Supports two forms:
-  //   `#<code>`               (bare/clean link) -> code = whole fragment, worker = DEFAULT_WORKER
-  //   `#k=<code>&w=<url-enc>`  (legacy)          -> code from k=, worker from w= (or DEFAULT_WORKER)
+  // Parse location.hash. Supports two forms (the worker is resolved separately, not baked here):
+  //   `#<code>`               (bare/clean link) -> code = whole fragment, worker from storage/prompt
+  //   `#k=<code>&w=<url-enc>`  (legacy)          -> code from k=, explicit worker from w=
   function parseHash() {
     const raw = (location.hash || '').replace(/^#/, '').trim();
-    if (!raw) return { k: '', w: DEFAULT_WORKER };
+    if (!raw) return { k: '', w: '' };
 
     if (/(?:^|&)[kw]=/.test(raw)) {           // param form: contains a k= or w=
       const p = new URLSearchParams(raw);
       let w = p.get('w') || '';
       if (w) { try { w = decodeURIComponent(w); } catch (e) { /* already decoded */ } }
-      w = (w || DEFAULT_WORKER).replace(/\/+$/, '');
-      return { k: (p.get('k') || '').trim(), w: w.trim() };
+      return { k: (p.get('k') || '').trim(), w: w.trim().replace(/\/+$/, '') };
     }
-    // bare form: the entire fragment is the paste code
-    return { k: raw, w: DEFAULT_WORKER.replace(/\/+$/, '') };
+    // bare form: the entire fragment is the paste code (worker comes from storage/prompt)
+    return { k: raw, w: '' };
   }
 
   // show exactly one of the top-level views; the editor view = topbar + layout together
