@@ -9,7 +9,7 @@
 ## Скачать
 Плагин: **[Releases](../../releases)** → `AlexMenus-<версия>.jar` → положи в `plugins/`.
 
-**📖 Документация:** **[Wiki](wiki/Home.md)** — меню, условия (все типы/форматы), действия, интеграции (LuckPerms / PlaceholderAPI / MyCommand), примеры.
+**📖 Документация:** **[сайт](https://alexfirst404.github.io/alexmenus-wiki/)** (MkDocs) — меню, условия, действия, интеграции (LuckPerms / PlaceholderAPI / MyCommand), примеры. Исходники — в [`wiki/`](wiki/Home.md).
 
 ## Скриншоты
 > Скриншоты интерфейса добавляются. Пока проще всего посмотреть редактор **вживую**: запусти `/am editor`
