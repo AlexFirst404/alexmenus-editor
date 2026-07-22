@@ -20,6 +20,10 @@ type: chest        # или inventory; любое другое/пустое зн
 | `permission` | Право на открытие меню (на всех путях). Пусто = без ограничения. |
 | `open-requirement` | Условие открытия меню (см. [Requirements](Requirements.md)). |
 | `items` | Предметы по слотам (см. [Items-and-Clicks](Items-and-Clicks.md)). |
+| `update-interval` | Живое обновление плейсхолдеров открытого меню, тики (см. [Advanced-Menu-Options](Advanced-Menu-Options.md)). |
+| `args` | Имена аргументов команды открытия → `{имя}`/`{argN}`/`{args}` (см. [Advanced-Menu-Options](Advanced-Menu-Options.md)). |
+| `open-item` | Предмет-открывашка в хотбаре, ПКМ открывает меню (см. [Advanced-Menu-Options](Advanced-Menu-Options.md)). |
+| `open-animation` | Пошаговое появление предметов при открытии, только `chest` (см. [Advanced-Menu-Options](Advanced-Menu-Options.md)). |
 
 ## `type: chest`
 
