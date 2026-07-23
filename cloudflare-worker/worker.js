@@ -9,6 +9,8 @@
 // Deploy: see README.md in this folder. Needs one KV namespace bound as PASTES.
 
 const TTL = 86400;                 // paste lifetime: 24h
+const APPLY_TTL = 600;             // live-apply push lifetime — matches the plugin's 10m watch window,
+                                   // so a push can't outlive the watcher that would consume it
 const MAX_BYTES = 2 * 1024 * 1024; // 2 MB bundle cap
 const KEY_LEN = 8;
 const ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"; // no look-alikes (0/o/1/l)
@@ -51,6 +53,33 @@ export default {
       const key = randomKey();
       await env.PASTES.put(key, body, { expirationTtl: TTL });
       return json({ key });
+    }
+
+    // Live "Apply": the plugin mints a session token in-game (/am editor) and polls it; the editor pushes
+    // the edited bundle to the same token. One-shot — a successful GET consumes the pending bundle.
+    //   POST /apply/<token>  -> { ok: true }
+    //   GET  /apply/<token>  -> the pending bundle (and clears it), or 404 when nothing is pending
+    const applySession = path.match(/^apply\/([A-Za-z0-9_-]{8,64})$/);
+    if (applySession) {
+      const kvKey = "apply:" + applySession[1];
+      if (request.method === "POST") {
+        const body = await request.text();
+        if (body.length > MAX_BYTES) return json({ error: "bundle too large" }, 413);
+        try { JSON.parse(body); } catch { return json({ error: "body is not JSON" }, 400); }
+        await env.PASTES.put(kvKey, body, { expirationTtl: APPLY_TTL });
+        return json({ ok: true });
+      }
+      if (request.method === "GET") {
+        // Short cacheTtl: KV caches NEGATIVE lookups at the edge too (60s by default), which would make the
+        // plugin's poller keep seeing "nothing pending" long after the editor pushed. This shortens that
+        // window; it does not eliminate it (a Durable Object would — see README).
+        const val = await env.PASTES.get(kvKey, { cacheTtl: 30 });
+        if (val === null) return json({ error: "nothing pending" }, 404);
+        await env.PASTES.delete(kvKey);
+        return new Response(val, {
+          headers: { "Content-Type": "application/json; charset=utf-8", ...cors() },
+        });
+      }
     }
 
     // Fetch a bundle by code.

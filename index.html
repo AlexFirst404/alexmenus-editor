@@ -26,13 +26,17 @@
       <span class="cur-menu" id="cur-menu-id">—</span>
     </div>
     <div class="top-actions">
+      <button class="btn icon" id="theme-btn" type="button" title="Светлая / тёмная тема" aria-label="Переключить тему">◐</button>
       <button class="btn toggle" id="graph-toggle" type="button" aria-pressed="false">
         <span class="tog-box" aria-hidden="true"></span> Граф
       </button>
       <button class="btn toggle" id="raw-toggle" type="button" aria-pressed="false">
         <span class="tog-box" aria-hidden="true"></span> Сырой YAML
       </button>
-      <button class="btn primary" id="save-btn" type="button">Сохранить и получить код</button>
+      <button class="btn primary" id="apply-btn" type="button"
+              title="Применить изменения прямо на сервере">Применить</button>
+      <button class="btn" id="save-btn" type="button"
+              title="Запасной путь: получить код для /am apply">Сохранить и получить код</button>
     </div>
   </header>
 
@@ -57,7 +61,7 @@
       <div class="center-toolbar" id="center-toolbar">
         <label class="field grow">
           <span class="lbl">Заголовок (title)</span>
-          <input type="text" id="menu-title" class="in" placeholder="<gradient:...>Меню</gradient>" />
+          <input type="text" id="menu-title" class="in" placeholder="&6&lМагазин  ·  &#ff5555hex  ·  <gradient:#f00:#00f>тоже" />
         </label>
         <label class="field rows-field" id="rows-field">
           <span class="lbl">Рядов</span>
@@ -106,7 +110,7 @@
               </div>
               <label class="field ms-sub-full">
                 <span class="lbl">Имя (name, MiniMessage)</span>
-                <input type="text" id="ms-oi-name" class="in" placeholder="<gold>Меню" />
+                <input type="text" id="ms-oi-name" class="in" placeholder="&6Меню" />
               </label>
               <label class="field">
                 <span class="lbl">custom-model-data (cmd)</span>
@@ -133,11 +137,14 @@
                   <option value="sweep">sweep — по слотам</option>
                   <option value="rows">rows — по рядам</option>
                   <option value="random">random — вразнобой</option>
+                  <option value="corners">corners — из четырёх углов</option>
+                  <option value="edges">edges — сверху и снизу к центру</option>
+                  <option value="ellipse">ellipse — эллипс из центра к краям</option>
                 </select>
               </label>
               <label class="field">
-                <span class="lbl">Интервал (тиков)</span>
-                <input type="number" id="ms-oa-interval" class="in" min="1" step="1" placeholder="2" />
+                <span class="lbl">Скорость <b id="ms-oa-speed-val">95</b> <span class="faint">1 — медленно · 100 — быстро</span></span>
+                <input type="range" id="ms-oa-speed" class="in range" min="1" max="100" step="1" value="95" />
               </label>
               <label class="field ms-sub-full">
                 <span class="lbl">Звук шага (sound)</span>
@@ -160,8 +167,15 @@
 
       <!-- Raw YAML escape hatch (triggers, open-requirement, conditional, dialog, ...) -->
       <div class="raw-wrap" id="raw-wrap" hidden>
-        <textarea id="raw-yaml" class="raw-area" spellcheck="false"
-                  aria-label="Сырой YAML текущего меню"></textarea>
+        <div class="raw-editor">
+          <div class="raw-gutter"><div class="raw-gutter-in" id="raw-gutter" aria-hidden="true"></div></div>
+          <div class="raw-code">
+            <pre class="raw-hl" id="raw-hl" aria-hidden="true"></pre>
+            <textarea id="raw-yaml" class="raw-area" spellcheck="false" wrap="off"
+                      autocapitalize="off" autocomplete="off" autocorrect="off"
+                      aria-label="Сырой YAML текущего меню"></textarea>
+          </div>
+        </div>
         <div class="raw-err" id="raw-err" hidden></div>
       </div>
 
@@ -225,12 +239,12 @@
 
         <label class="field">
           <span class="lbl">Имя (name, MiniMessage)</span>
-          <input type="text" id="f-name" class="in" placeholder="<green>Кнопка" />
+          <input type="text" id="f-name" class="in" placeholder="&aКнопка  (или &#55ff55, <green>)" />
         </label>
 
         <label class="field">
           <span class="lbl">Лор (lore, по строке на ряд)</span>
-          <textarea id="f-lore" class="in area" rows="3" placeholder="<gray>Первая строка&#10;<gray>Вторая строка"></textarea>
+          <textarea id="f-lore" class="in area" rows="3" placeholder="&7Первая строка&#10;&#ffaa00Вторая строка"></textarea>
         </label>
 
         <div class="field">

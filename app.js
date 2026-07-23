@@ -104,6 +104,7 @@
   const state = {
     workerBase: '',        // Worker base URL (from hash `w=`, or saved in localStorage)
     code: '',              // paste code (from hash)
+    applyToken: '',        // live-apply session token (from hash `a=`); empty -> only the code flow works
     menus: [],             // [{ id, obj }]  — obj = parsed menu object
     sel: -1,               // index of the selected menu
     selected: new Set(),   // set of selected slot indices (ints)
@@ -122,6 +123,8 @@
   const graphPos = {};         // menu/ghost id -> { x, y } center
   let graphNodes = [];         // current node list
   let graphEdges = [];         // [{ from, to, node(SVG el) }]
+  let graphView = null;        // current viewBox {x,y,w,h} (mouse-wheel zoom + drag pan)
+  let graphPan = null;         // active background-pan gesture
 
   // ------------------------------------------------------------------ tiny DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -147,6 +150,12 @@
       return;
     }
     state.code = hash.k;
+    state.applyToken = hash.a || '';
+    const applyBtn = $('apply-btn');
+    if (applyBtn && !state.applyToken) {     // old/bare link: only the "get a code" flow is available
+      applyBtn.disabled = true;
+      applyBtn.title = 'Ссылка без live-сессии — открой редактор командой /am editor';
+    }
     state.workerBase = await resolveWorker(hash.w);
     if (!state.workerBase) {   // no worker configured for this browser -> can't load; explain
       show('empty-state');
@@ -160,16 +169,16 @@
   //   `#k=<code>&w=<url-enc>`  (legacy)          -> code from k=, explicit worker from w=
   function parseHash() {
     const raw = (location.hash || '').replace(/^#/, '').trim();
-    if (!raw) return { k: '', w: '' };
+    if (!raw) return { k: '', w: '', a: '' };
 
-    if (/(?:^|&)[kw]=/.test(raw)) {           // param form: contains a k= or w=
+    if (/(?:^|&)[kwa]=/.test(raw)) {          // param form: contains a k=, w= or a=
       const p = new URLSearchParams(raw);
       let w = p.get('w') || '';
       if (w) { try { w = decodeURIComponent(w); } catch (e) { /* already decoded */ } }
-      return { k: (p.get('k') || '').trim(), w: w.trim().replace(/\/+$/, '') };
+      return { k: (p.get('k') || '').trim(), w: w.trim().replace(/\/+$/, ''), a: (p.get('a') || '').trim() };
     }
     // bare form: the entire fragment is the paste code (worker comes from storage/prompt)
-    return { k: raw, w: '' };
+    return { k: raw, w: '', a: '' };
   }
 
   // show exactly one of the top-level views; the editor view = topbar + layout together
@@ -253,6 +262,38 @@
       openSaveModal(out.key);
     } catch (e) {
       toast('Не удалось сохранить: ' + (e && e.message ? e.message : 'сеть'), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // ================================================================== APPLY  (POST <w>/apply/<token>)
+  // Pushes the edited bundle straight back to the server that opened this editor: /am editor mints a
+  // one-shot session token, puts it in the link, and polls for it. saveBundle() stays as the fallback.
+  async function applyLive() {
+    if (!commitRaw()) return;                 // flush raw editor; abort if its YAML is invalid
+    if (!state.menus.length) { toast('Нет меню для применения', 'err'); return; }
+    if (!state.applyToken) {
+      toast('Эта ссылка без live-сессии — используй «Сохранить и получить код»', 'err');
+      return;
+    }
+    const btn = $('apply-btn');
+    btn.disabled = true;
+    try {
+      const menus = state.menus.map((m) => ({
+        id: m.id,
+        yaml: jsyaml.dump(m.obj, { lineWidth: -1, noRefs: true, indent: 2 })
+      }));
+      const res = await fetch(state.workerBase + '/apply/' + encodeURIComponent(state.applyToken), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ v: BUNDLE_VERSION, menus })
+      });
+      if (!res.ok) throw new Error('POST /apply -> ' + res.status);
+      toast('Отправлено — сервер подхватит изменения (обычно за секунды, изредка до минуты)');
+    } catch (e) {
+      toast('Не удалось применить: ' + (e && e.message ? e.message : 'сеть')
+            + '. Используй «Сохранить и получить код».', 'err');
     } finally {
       btn.disabled = false;
     }
@@ -400,20 +441,29 @@
 
     // open-animation {type, interval, sound} — omitted when type is none/empty
     const oa = (m.obj['open-animation'] && typeof m.obj['open-animation'] === 'object') ? m.obj['open-animation'] : {};
-    const oaType = $('ms-oa-type'), oaInt = $('ms-oa-interval'), oaSound = $('ms-oa-sound');
+    const oaType = $('ms-oa-type'), oaSpeed = $('ms-oa-speed'), oaSpeedVal = $('ms-oa-speed-val'), oaSound = $('ms-oa-sound');
     oaType.value = normalizeOaType(oa.type);
-    oaInt.value = oa.interval != null ? String(oa.interval) : '';
+    oaSpeed.value = String(oaSpeedOf(oa));
+    oaSpeedVal.textContent = oaSpeed.value;
     oaSound.value = oa.sound != null ? String(oa.sound) : '';
+    // A legacy `interval` outside the representable 1..20 tick range has no exact 1..100 speed; keep it
+    // verbatim until the admin actually moves the slider, instead of silently speeding the menu up.
+    const legacyIv = (oa && oa.speed == null && oa.interval != null) ? parseInt(oa.interval, 10) : NaN;
+    const legacyUnrepresentable = !isNaN(legacyIv) && (legacyIv < 1 || legacyIv > 20);
+    const legacySliderValue = oaSpeedOf(oa);
     const syncOpenAnim = () => {
+      oaSpeedVal.textContent = oaSpeed.value;
       const t = oaType.value;
       if (!t || t === 'none') { delete m.obj['open-animation']; return; }
       const spec = { type: t };
-      const iv = parseInt(oaInt.value, 10); if (!isNaN(iv) && iv >= 1) spec.interval = iv;
+      const sp = parseInt(oaSpeed.value, 10);
+      if (legacyUnrepresentable && sp === legacySliderValue) spec.interval = legacyIv;
+      else if (!isNaN(sp)) spec.speed = Math.max(1, Math.min(100, sp));   // 1..100 (legacy is migrated)
       const snd = oaSound.value.trim(); if (snd) spec.sound = snd;
       m.obj['open-animation'] = spec;
     };
     oaType.onchange = syncOpenAnim;
-    oaInt.oninput = syncOpenAnim;
+    oaSpeed.oninput = syncOpenAnim;
     oaSound.oninput = syncOpenAnim;
 
     // open-requirement (block: require + deny/success actions) — top-level menu key
@@ -815,7 +865,22 @@
     if (s === 'sweep' || s === 'slots' || s === 'slot') return 'sweep';
     if (s === 'rows' || s === 'row') return 'rows';
     if (s === 'random' || s === 'shuffle') return 'random';
+    if (s === 'corners' || s === 'corner') return 'corners';
+    if (s === 'edges' || s === 'converge' || s === 'top_bottom' || s === 'top-bottom') return 'edges';
+    if (s === 'ellipse' || s === 'oval' || s === 'ripple' || s === 'center') return 'ellipse';
     return 'none';
+  }
+  // stored open-animation pace -> a 1..100 slider value (legacy `interval` ticks are converted)
+  function oaSpeedOf(oa) {
+    if (oa && oa.speed != null) {
+      const s = parseInt(oa.speed, 10);
+      if (!isNaN(s)) return Math.max(1, Math.min(100, s));
+    }
+    if (oa && oa.interval != null) {
+      const iv = parseInt(oa.interval, 10);
+      if (!isNaN(iv)) return Math.max(1, Math.min(100, 100 - (iv - 1) * 5));
+    }
+    return 95;   // ≈2 ticks/step — matches the pre-speed default instead of the much slower slider midpoint
   }
 
   // ================================================================== BULK-EDIT helpers
@@ -2375,6 +2440,7 @@
   function dumpRaw() {
     const m = current();
     $('raw-yaml').value = m ? jsyaml.dump(m.obj, { lineWidth: -1, noRefs: true, indent: 2 }) : '';
+    updateRawView();
     hideRawErr();
   }
 
@@ -2415,12 +2481,118 @@
       if (state.raw) { if (!commitRaw()) { toast('Исправь YAML, затем переключись', 'err'); return; } state.raw = false; }
       state.reqEdit = false; state.reqEditCtx = null;
       state.graph = true;
+      graphView = null;   // reset zoom/pan to fit on each fresh open
       syncModes();
     }
   }
 
   function showRawErr(msg) { const e = $('raw-err'); e.textContent = 'YAML: ' + msg; e.hidden = false; }
   function hideRawErr() { $('raw-err').hidden = true; }
+
+  // ================================================================== THEME (light / dark)
+  const THEME_KEY = 'am_theme';
+  function applyStoredTheme() {
+    let t = 'dark';
+    try { t = localStorage.getItem(THEME_KEY) || 'dark'; } catch (e) { /* private mode */ }
+    setTheme(t === 'light' ? 'light' : 'dark');
+  }
+  function setTheme(t) {
+    const root = document.documentElement;
+    if (t === 'light') root.setAttribute('data-theme', 'light');
+    else root.removeAttribute('data-theme');
+    const btn = $('theme-btn');
+    if (btn) { btn.textContent = t === 'light' ? '☀' : '◐'; btn.setAttribute('aria-pressed', t === 'light' ? 'true' : 'false'); }
+    try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* private mode */ }
+  }
+  function toggleTheme() {
+    setTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
+  }
+
+  // ================================================================== RAW YAML highlight + gutter
+  function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function hlYamlValue(v) {
+    const lead = v.match(/^\s*/)[0];
+    const body = v.slice(lead.length);
+    if (body === '') return escHtml(v);
+    let cls = 'ys';
+    if (/^(true|false|null|~|yes|no|on|off)$/i.test(body)) cls = 'yn';
+    else if (/^-?\d+(\.\d+)?$/.test(body)) cls = 'yn';
+    return escHtml(lead) + '<span class="' + cls + '">' + escHtml(body) + '</span>';
+  }
+  function highlightYaml(src) {
+    return src.split('\n').map((raw) => {
+      // trailing/full-line comment: # at line start or after whitespace (good-enough; ignores # in quotes)
+      let code = raw, comment = '';
+      const cm = raw.match(/(?:^|\s)#.*$/);
+      if (cm) { const i = raw.length - cm[0].length; code = raw.slice(0, i); comment = raw.slice(i); }
+      let html;
+      const km = code.match(/^(\s*(?:-\s+)?)([^:#\s][^:]*?)(:)(\s.*|$)/);
+      if (km) {
+        html = escHtml(km[1]) + '<span class="yk">' + escHtml(km[2]) + '</span><span class="yp">:</span>' + hlYamlValue(km[4]);
+      } else {
+        const lm = code.match(/^(\s*)(-\s+)?(.*)$/);
+        html = escHtml(lm[1]) + (lm[2] ? '<span class="yp">' + escHtml(lm[2]) + '</span>' : '') + hlYamlValue(lm[3]);
+      }
+      if (comment) html += '<span class="yc">' + escHtml(comment) + '</span>';
+      return html;
+    }).join('\n');
+  }
+  function updateRawView() {
+    const ta = $('raw-yaml');
+    if (!ta) return;
+    const val = ta.value;
+    const hl = $('raw-hl');
+    if (hl) hl.innerHTML = highlightYaml(val) + '\n';   // trailing newline so the final line renders
+    const gut = $('raw-gutter');
+    if (gut) {
+      const n = Math.max(1, val.split('\n').length);
+      let s = '';
+      for (let i = 1; i <= n; i++) s += i + '\n';
+      gut.textContent = s;
+    }
+    syncRawScroll();
+  }
+  function syncRawScroll() {
+    const ta = $('raw-yaml'), hl = $('raw-hl'), gut = $('raw-gutter');
+    if (!ta) return;
+    if (hl) { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
+    if (gut) gut.style.transform = 'translateY(' + (-ta.scrollTop) + 'px)';
+  }
+
+  // ================================================================== GRAPH zoom (wheel) + pan (drag)
+  function applyGraphView() {
+    if (!graphView) return;
+    $('graph-svg').setAttribute('viewBox', graphView.x + ' ' + graphView.y + ' ' + graphView.w + ' ' + graphView.h);
+  }
+  function onGraphWheel(e) {
+    if (!state.graph || !graphView) return;
+    e.preventDefault();
+    const rect = $('graph-svg').getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const fx = (e.clientX - rect.left) / rect.width, fy = (e.clientY - rect.top) / rect.height;
+    const px = graphView.x + fx * graphView.w, py = graphView.y + fy * graphView.h;
+    const aspect = graphView.h / graphView.w;
+    const factor = e.deltaY < 0 ? 0.85 : 1 / 0.85;   // wheel up -> zoom in
+    let nw = Math.max(140, Math.min(6000, graphView.w * factor));
+    const nh = nw * aspect;
+    graphView = { x: px - fx * nw, y: py - fy * nh, w: nw, h: nh };
+    applyGraphView();
+  }
+  function onGraphDown(e) {
+    if (!state.graph || !graphView || e.button !== 0) return;
+    if (e.target.closest('.gnode')) return;   // nodes handle their own drag
+    const rect = $('graph-svg').getBoundingClientRect();
+    graphPan = { sx: e.clientX, sy: e.clientY, ox: graphView.x, oy: graphView.y,
+                 uw: graphView.w / rect.width, uh: graphView.h / rect.height };
+    e.preventDefault();
+  }
+  function onGraphMove(e) {
+    if (!graphPan) return;
+    graphView.x = graphPan.ox - (e.clientX - graphPan.sx) * graphPan.uw;
+    graphView.y = graphPan.oy - (e.clientY - graphPan.sy) * graphPan.uh;
+    applyGraphView();
+  }
+  function onGraphUp() { graphPan = null; }
 
   // ================================================================== NAVIGATION GRAPH
   const SVGNS = 'http://www.w3.org/2000/svg';
@@ -2498,8 +2670,9 @@
     const rect = wrap.getBoundingClientRect();
     const W = Math.max(320, Math.round(rect.width) || 800);
     const H = Math.max(280, Math.round(rect.height) || 500);
-    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    if (!graphView) graphView = { x: 0, y: 0, w: W, h: H };
     svg.setAttribute('width', W); svg.setAttribute('height', H);
+    applyGraphView();
 
     // circle layout; keep any position already set (so drags persist)
     const cx = W / 2, cy = H / 2, R = Math.max(90, Math.min(W, H) / 2 - 80);
@@ -2991,10 +3164,22 @@
 
   // ================================================================== static wiring
   function wireStaticUi() {
+    applyStoredTheme();
+    $('theme-btn').onclick = toggleTheme;
+
+    $('apply-btn').onclick = applyLive;
     $('save-btn').onclick = saveBundle;
     $('raw-toggle').onclick = toggleRaw;
     $('graph-toggle').onclick = toggleGraph;
     $('raw-yaml').addEventListener('blur', commitRaw);
+    $('raw-yaml').addEventListener('input', updateRawView);
+    $('raw-yaml').addEventListener('scroll', syncRawScroll);
+
+    // graph: mouse-wheel zoom + background drag-pan (node drags handled separately)
+    $('graph-svg').addEventListener('wheel', onGraphWheel, { passive: false });
+    $('graph-svg').addEventListener('mousedown', onGraphDown);
+    document.addEventListener('mousemove', onGraphMove);
+    document.addEventListener('mouseup', onGraphUp);
 
     $('new-menu-btn').onclick = openNewMenu;
     $('dup-menu-btn').onclick = duplicateMenu;
