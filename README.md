@@ -24,10 +24,13 @@
 - **Права** меню: `permission:` — на всех путях открытия.
 - **Requirements-движок** (view/click/open) — см. ниже.
 - **Действия** вкл. экономику Vault (`give_money`/`take_money`), опыт, `broadcast`, `sound`, и модификаторы `chance`/`delay`.
+- **Головы игроков** (`material: PLAYER_HEAD`): `head-owner` (`%player_name%` → голова смотрящего), `head-uuid`,
+  `head-texture` (base64 / URL скина / hash — оффлайн) + DeluxeMenus-префиксы `basehead-`/`texture-`/`head-`.
 - **`/am reload`** перезагружает плагин целиком.
 - **Редактор:** **пикер всех блоков/предметов 1.21.11** (поиск+иконки), **точные иконки как в майне**
-  (блоки — 3D-рендер vanilla через deepslate), **node-граф условий**, панель requirements (view/click/open),
-  граф навигации, свои модалки/чекбоксы, мультивыделение, контекстное меню (ПКМ).
+  (блоки — 3D-рендер vanilla через deepslate), **головы игроков — точное лицо** (texture/uuid/ник),
+  **node-граф условий**, панель requirements (view/click/open), граф навигации, свои модалки/чекбоксы,
+  мультивыделение, контекстное меню (ПКМ).
 
 ## Requirements-движок
 Три места для условий:

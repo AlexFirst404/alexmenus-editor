@@ -455,7 +455,7 @@
     cell.append(el('span', 'cell-num', String(slot)));
     if (item) {
       cell.classList.add('filled');
-      cell.append(makeIconHolder(item.material, 58, 'cell-txt', true));
+      cell.append(makeItemIconHolder(item, 58, 'cell-txt', true));
     }
     if (state.selected.has(slot)) cell.classList.add('selected');
     if (state.active === slot) cell.classList.add('active');
@@ -570,9 +570,9 @@
     // material (never a STONE default); the picker button opens the full material list (feature 4).
     const fMat = $('f-material');
     fMat.value = disp.material != null ? String(disp.material) : '';
-    setMatIcon(disp.material);
-    fMat.oninput = () => assignMaterialLive(fMat.value);
-    fMat.onchange = () => { setMatIcon(fMat.value); renderGrid(); renderProps(); };
+    setItemIcon(disp);
+    fMat.oninput = () => { assignMaterialLive(fMat.value); renderHeadFields(activeItemObj() || { material: fMat.value }); };
+    fMat.onchange = () => { renderGrid(); renderProps(); };
 
     // EMPTY-slot state: no item yet -> show the "pick a material" prompt and HIDE the rest of the
     // editor, so name/lore/flags/requirements can never materialise a STONE placeholder.
@@ -598,6 +598,7 @@
       else it.lore = fLore.value.split('\n');
     }, false);
 
+    renderHeadFields(disp);
     renderFlags(disp);
     renderClicks(disp);
     renderSlotRequirements(disp);   // view-requirement + click-requirement builders (bulk-aware)
@@ -861,6 +862,11 @@
     });
     return out;
   }
+  // when an item's material is no longer a head, drop stale head-* keys (else they linger as YAML cruft
+  // and silently re-skin the item if its material is later switched back to a head)
+  function stripHeadIfNotHead(it) {
+    if (it && !headDescOf(it)) { delete it['head-owner']; delete it['head-uuid']; delete it['head-texture']; }
+  }
   // Live material edit from the text field: set material on the active slot + every selected slot,
   // creating items ONLY where a non-empty material is given (never a STONE default).
   function assignMaterialLive(val) {
@@ -872,7 +878,7 @@
     targetSlots().forEach((s) => {
       const k = String(s);
       if (empty) delete m.obj.items[k];              // clearing the material removes the item (no phantom {material:''})
-      else if (m.obj.items[k]) m.obj.items[k].material = val;
+      else if (m.obj.items[k]) { m.obj.items[k].material = val; stripHeadIfNotHead(m.obj.items[k]); }
       else m.obj.items[k] = { material: val };
     });
     updateSelCounter();
@@ -886,7 +892,7 @@
     if (!m.obj.items) m.obj.items = {};
     slots.forEach((s) => {
       const k = String(s);
-      if (m.obj.items[k]) m.obj.items[k].material = mat;
+      if (m.obj.items[k]) { m.obj.items[k].material = mat; stripHeadIfNotHead(m.obj.items[k]); }
       else m.obj.items[k] = { material: mat };
     });
   }
@@ -2103,8 +2109,10 @@
       const holders = grid.querySelectorAll('.ic-holder');
       if (!holders.length) return;
       let anyLoaded = false;
-      holders.forEach((h) => { if (h.childElementCount > 0) anyLoaded = true; });
-      if (!anyLoaded) holders.forEach((h) => { if (h.childElementCount === 0) loadIcon(h); });
+      // head holders fill eagerly (not via IO), so exclude them — else one head makes the probe think IO
+      // fired and the blank lazy material icons never get force-loaded in a background tab.
+      holders.forEach((h) => { if (!h.classList.contains('head-holder') && h.childElementCount > 0) anyLoaded = true; });
+      if (!anyLoaded) holders.forEach((h) => { if (!h.classList.contains('head-holder') && h.childElementCount === 0) loadIcon(h); });
     }, 700);
   }
 
@@ -2184,6 +2192,168 @@
   }
   // props material preview (small): same resolver, rendered immediately
   function setMatIcon(material) { setMatIconEl($('mat-ic'), material); }
+
+  // ============================ PLAYER HEADS (custom skins) ============================
+  // A slot renders a head face (like the client) when its material is a player head. Sources:
+  //   head-texture  base64 textures value | skin URL | textures.minecraft.net hash  (drawn locally)
+  //   head-uuid     player UUID  -> crafatar avatar
+  //   head-owner    player name  -> minotar helm (placeholders -> a neutral Steve face)
+  // DeluxeMenus-style `material:` prefixes (basehead-/texture-/head-) are recognised too so imported
+  // configs render. head-* keys on a NON-head material are ignored (mirrors the plugin).
+  function isHeadName(mat) {
+    // Only a literal player_head is a real head item in the plugin — mob skulls & player_wall_head aren't
+    // items, and 'skull'/'playerhead' don't resolve (all fall back to STONE). DeluxeMenus material
+    // prefixes (basehead-/texture-/head-) are recognised separately in headDescOf.
+    return stripNs(String(mat || '').toLowerCase()).replace(/\s+/g, '').trim() === 'player_head';
+  }
+  function trimOrNull(v) { const s = (v == null ? '' : String(v)).trim(); return s || null; }
+
+  function headDescOf(item) {
+    if (!item) return null;
+    const mat = String(item.material || '');
+    const low = mat.toLowerCase();
+    let texture = trimOrNull(item['head-texture']);
+    let owner = trimOrNull(item['head-owner']);
+    let uuid = trimOrNull(item['head-uuid']);
+    let isHead = isHeadName(mat);
+    if (!texture && (low.startsWith('basehead-') || low.startsWith('texture-'))) { texture = mat.slice(mat.indexOf('-') + 1); isHead = true; }
+    else if (!owner && low.startsWith('head-')) { owner = mat.slice(mat.indexOf('-') + 1); isHead = true; }
+    if (!isHead) return null;
+    return { texture, owner, uuid };
+  }
+
+  function skinUrlFromTexture(tex) {
+    if (!tex) return null;
+    const t = String(tex).trim();
+    const toHttps = (u) => u.replace(/^http:\/\//i, 'https://');   // https skin URL: avoid mixed-content block
+    if (/^https?:\/\//i.test(t)) return toHttps(t);
+    if (/^[0-9a-fA-F]{20,}$/.test(t)) return 'https://textures.minecraft.net/texture/' + t.toLowerCase();
+    try {
+      const j = JSON.parse(atob(t));
+      const u = j && j.textures && j.textures.SKIN && j.textures.SKIN.url;
+      if (u) return toHttps(String(u));
+    } catch (e) { /* not a base64 textures value */ }
+    return null;
+  }
+
+  // Ordered face-render fallbacks by input (minotar accepts both names and UUIDs; mc-heads as backup).
+  // A name with a placeholder (%..%, {..}) can't be resolved at design time -> a neutral Steve face.
+  function faceServiceUrls(desc, size) {
+    let id;
+    if (desc.uuid) id = String(desc.uuid).replace(/-/g, '');
+    else if (desc.owner && !/[%{}]/.test(desc.owner)) id = desc.owner;
+    else id = 'MHF_Steve';
+    const q = encodeURIComponent(id);
+    return [
+      'https://minotar.net/helm/' + q + '/' + size + '.png',
+      'https://mc-heads.net/avatar/' + q + '/' + size,
+    ];
+  }
+
+  function makeHeadHolder(desc, sizePx, txtCls) {
+    const holder = el('div', 'ic-holder head-holder');
+    holder.style.setProperty('--sz', sizePx + 'px');
+    const url = skinUrlFromTexture(desc.texture);
+    if (url) { drawHeadFace(holder, url, txtCls); return holder; }
+    const urls = faceServiceUrls(desc, 64);
+    const img = document.createElement('img');
+    img.className = 'head-face'; img.alt = ''; img.loading = 'eager';
+    let i = 0;
+    img.onerror = () => {
+      if (++i < urls.length) { img.src = urls[i]; return; }   // try the next service before giving up
+      img.remove(); if (!holder.firstChild) holder.append(el('span', txtCls || 'cell-txt', 'head'));
+    };
+    img.src = urls[0];
+    holder.append(img);
+    return holder;
+  }
+
+  // Draw the 8x8 face (+ hat overlay) from a skin PNG onto a crisp canvas. Cross-origin images taint the
+  // canvas, which blocks pixel READBACK but not display — so this renders fine without CORS headers.
+  function drawHeadFace(holder, skinUrl, txtCls) {
+    const cv = document.createElement('canvas');
+    cv.width = 64; cv.height = 64;           // 8px face * 8 = crisp
+    cv.className = 'head-face';
+    const ctx = cv.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    const img = new Image();
+    img.onload = () => {
+      try {
+        ctx.clearRect(0, 0, 64, 64);
+        ctx.drawImage(img, 8, 8, 8, 8, 0, 0, 64, 64);   // face
+        ctx.drawImage(img, 40, 8, 8, 8, 0, 0, 64, 64);  // hat overlay
+      } catch (e) { /* leave whatever drew */ }
+    };
+    img.onerror = () => { cv.remove(); if (!holder.firstChild) holder.append(el('span', txtCls || 'cell-txt', 'head')); };
+    img.src = skinUrl;
+    holder.append(cv);
+  }
+
+  // head-aware icon: a head face when the item is a head, else the normal material resolver
+  function makeItemIconHolder(item, sizePx, txtCls, lazy, observer) {
+    const desc = headDescOf(item);
+    if (desc) return makeHeadHolder(desc, sizePx, txtCls);
+    return makeIconHolder(item.material, sizePx, txtCls, lazy, observer);
+  }
+
+  // head-aware small preview (props material row)
+  function setItemIcon(item) {
+    const holder = $('mat-ic');
+    if (!holder) return;
+    clear(holder);
+    const desc = headDescOf(item);
+    if (desc) holder.append(makeHeadHolder(desc, 28, 'mi-txt'));
+    else if (item && item.material && String(item.material).trim()) holder.append(makeIconHolder(item.material, 28, 'mi-txt', false));
+  }
+
+  function activeItemObj() {
+    const m = current();
+    return (m && m.obj.items && m.obj.items[String(state.active)]) || null;
+  }
+
+  // migrate a DeluxeMenus-prefix material (basehead-/texture-/head-<v>) into native player_head + head-*
+  // keys, so editing a head field doesn't drop the skin that was carried inside the material string.
+  function normalizeHeadMaterial(it) {
+    const mat = String(it.material || '');
+    const low = mat.toLowerCase();
+    if (low.startsWith('basehead-') || low.startsWith('texture-')) {
+      if (!trimOrNull(it['head-texture'])) it['head-texture'] = mat.slice(mat.indexOf('-') + 1);
+      it.material = 'player_head';
+    } else if (low.startsWith('head-')) {
+      if (!trimOrNull(it['head-owner'])) it['head-owner'] = mat.slice(mat.indexOf('-') + 1);
+      it.material = 'player_head';
+    }
+  }
+
+  // populate + wire the head fields; visible whenever the item is a head (incl. DeluxeMenus prefixes),
+  // matching the face preview (headDescOf) rather than only a literal player_head material.
+  function renderHeadFields(disp) {
+    const wrap = $('f-head-fields');
+    if (!wrap) return;
+    const desc = headDescOf(disp);
+    if (!desc) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    const fo = $('f-head-owner'), fu = $('f-head-uuid'), ft = $('f-head-texture');
+    fo.value = desc.owner || '';   // seed from the decomposed desc so a prefix-carried skin still shows
+    fu.value = desc.uuid || '';
+    ft.value = desc.texture || '';
+    const wire = (input, key) => () => {
+      // only touch actual head items (never a non-head slot in a mixed selection); migrate any prefix first
+      applyBulk((it) => { if (headDescOf(it)) { normalizeHeadMaterial(it); setOrDel(it, key, input.value); } }, false);
+      afterHeadEdit();
+    };
+    fo.oninput = wire(fo, 'head-owner');
+    fu.oninput = wire(fu, 'head-uuid');
+    ft.oninput = wire(ft, 'head-texture');
+  }
+  // keep the material field + previews in sync (normalizeHeadMaterial may have rewritten the material)
+  function afterHeadEdit() {
+    const it = activeItemObj();
+    const fMat = $('f-material');
+    if (it && fMat && it.material != null) fMat.value = String(it.material);
+    setItemIcon(it || {});
+    renderGrid();
+  }
 
   // ================================================================== VIEW MODES (raw / graph)
   // raw and graph are mutually exclusive; both replace the center+right area.

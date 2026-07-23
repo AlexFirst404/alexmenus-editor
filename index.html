@@ -208,6 +208,16 @@
 
         <!-- Full item editor, shown only once the active slot holds an item -->
         <div class="slot-rest" id="slot-rest">
+
+        <!-- Custom player-head skin — shown only when the material is a player head. Fill one field. -->
+        <div class="field head-fields" id="f-head-fields" hidden>
+          <span class="lbl">Голова игрока (кастомный скин)</span>
+          <input type="text" id="f-head-owner" class="in" placeholder="Ник владельца (head-owner) — %player_name% тоже" />
+          <input type="text" id="f-head-uuid" class="in" placeholder="UUID (head-uuid)" />
+          <textarea id="f-head-texture" class="in area" rows="2" placeholder="Текстура (head-texture): base64 / URL скина / hash"></textarea>
+          <p class="faint">Заполни одно поле. <b>Текстура</b> — самый надёжный путь (оффлайн, точный скин). Ник/UUID берут скин онлайн-игрока или из кэша сервера.</p>
+        </div>
+
         <label class="field">
           <span class="lbl">custom-model-data (cmd)</span>
           <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
