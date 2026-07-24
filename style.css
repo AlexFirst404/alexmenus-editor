@@ -264,8 +264,18 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .ic-holder img.flat { width:86%; height:86%; image-rendering:pixelated; object-fit:contain; }
 /* deepslate 3D block render (PNG data URL): the isometric image already carries its own margin */
 .ic-holder img.block3d { width:100%; height:100%; image-rendering:pixelated; object-fit:contain; }
-/* custom player-head face (local canvas crop or avatar-service img): fills the holder, crisp */
+/* custom player-head face (fallback flat render): fills the holder, crisp */
 .ic-holder .head-face { width:100%; height:100%; image-rendering:pixelated; object-fit:contain; }
+/* vanilla-style isometric player head: the base cube plus the larger "hat" (second skin layer) over it.
+   preserve-3d keeps the .ic-holder perspective applying to the nested cubes. */
+.ic-holder .head3d {
+  position:relative; width:var(--sz); height:var(--sz); transform-style:preserve-3d;
+}
+.ic-holder .head3d .cube {
+  position:absolute; top:50%; left:50%;
+  margin-top:calc(var(--s) / -2); margin-left:calc(var(--s) / -2);
+}
+.ic-holder .head3d .cube.hat { transform:rotateX(-26deg) rotateY(45deg) scale(1.09); }
 .head-fields { display:flex; flex-direction:column; gap:6px; }
 .head-fields .lbl { margin-bottom:2px; }
 

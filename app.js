@@ -2259,10 +2259,11 @@
   function setMatIcon(material) { setMatIconEl($('mat-ic'), material); }
 
   // ============================ PLAYER HEADS (custom skins) ============================
-  // A slot renders a head face (like the client) when its material is a player head. Sources:
-  //   head-texture  base64 textures value | skin URL | textures.minecraft.net hash  (drawn locally)
-  //   head-uuid     player UUID  -> crafatar avatar
-  //   head-owner    player name  -> minotar helm (placeholders -> a neutral Steve face)
+  // A slot renders a vanilla-style isometric head cube built from the full skin sheet (see buildHeadCube)
+  // when its material is a player head. Skin sources, in fallback order (headSkinUrls):
+  //   head-texture  base64 textures value | skin URL | textures.minecraft.net hash
+  //   head-uuid     player UUID  -> minotar.net/skin/<id>.png, then mc-heads.net/skin/<id>
+  //   head-owner    player name  -> same two hosts (a %..%/{..} placeholder can't resolve -> Steve's skin)
   // DeluxeMenus-style `material:` prefixes (basehead-/texture-/head-) are recognised too so imported
   // configs render. head-* keys on a NON-head material are ignored (mirrors the plugin).
   function isHeadName(mat) {
@@ -2301,57 +2302,112 @@
     return null;
   }
 
-  // Ordered face-render fallbacks by input (minotar accepts both names and UUIDs; mc-heads as backup).
-  // A name with a placeholder (%..%, {..}) can't be resolved at design time -> a neutral Steve face.
-  function faceServiceUrls(desc, size) {
-    let id;
+  // FULL SKIN urls (not a flat face) in fallback order — the isometric cube below is built from the skin
+  // sheet, so we always need the whole thing. A name carrying a placeholder (%..%, {..}) can't be resolved
+  // at design time -> a neutral Steve skin.
+  function headSkinUrls(desc) {
+    const out = [];
+    const tex = skinUrlFromTexture(desc.texture);
+    if (tex) out.push(tex);
+    let id = null;
     if (desc.uuid) id = String(desc.uuid).replace(/-/g, '');
     else if (desc.owner && !/[%{}]/.test(desc.owner)) id = desc.owner;
-    else id = 'MHF_Steve';
-    const q = encodeURIComponent(id);
-    return [
-      'https://minotar.net/helm/' + q + '/' + size + '.png',
-      'https://mc-heads.net/avatar/' + q + '/' + size,
-    ];
+    if (id) {
+      const q = encodeURIComponent(id);
+      out.push('https://minotar.net/skin/' + q + '.png');
+      out.push('https://mc-heads.net/skin/' + q);
+    }
+    out.push('https://minotar.net/skin/MHF_Steve.png');
+    return out;
   }
+
+  // Head tiles inside a Minecraft skin sheet — [x, y] of the 8x8 tile. The second ("hat") layer uses the
+  // same layout shifted +32px in x. `right` faces the viewer in the isometric cube, so it carries the face.
+  const HEAD_TILES = { top: [8, 0], right: [8, 8], left: [0, 8] };
+
+  function headFace(cls, skinUrl, x, y) {
+    const d = el('div', 'face ' + cls);
+    d.style.backgroundImage = "url('" + skinUrl + "')";
+    // 8 tiles across the sheet; `auto` height keeps legacy 64x32 skins correct too
+    d.style.backgroundSize = 'calc(var(--s) * 8) auto';
+    d.style.backgroundPosition = 'calc(var(--s) * ' + (-x / 8) + ') calc(var(--s) * ' + (-y / 8) + ')';
+    d.style.backgroundRepeat = 'no-repeat';
+    return d;
+  }
+
+  // Vanilla-style isometric head: the base cube plus the slightly larger "hat" (second skin layer) on top —
+  // the same three-face CSS cube the block icons use, so heads sit in the grid like real inventory items.
+  function buildHeadCube(skinUrl, withHat) {
+    const wrap = el('div', 'head3d');
+    const base = el('div', 'cube');
+    const hat = withHat ? el('div', 'cube hat') : null;
+    ['top', 'left', 'right'].forEach((cls) => {
+      const t = HEAD_TILES[cls];
+      base.append(headFace(cls, skinUrl, t[0], t[1]));
+      if (hat) hat.append(headFace(cls, skinUrl, t[0] + 32, t[1]));
+    });
+    wrap.append(base);
+    if (hat) wrap.append(hat);
+    return wrap;
+  }
+
+  /**
+   * Vanilla's legacy-skin rule: on a 64x32 sheet the hat region is only genuine when it contains
+   * transparency — a fully opaque block there is filler that the client zeroes out. Drawing it anyway
+   * would box the face in. Needs a CORS read; all three skin hosts send `Access-Control-Allow-Origin: *`,
+   * and if the read is refused we assume filler (a missing rare legacy hat beats a box over the face).
+   */
+  function legacyHatIsReal(url, done) {
+    const cors = new Image();
+    cors.crossOrigin = 'anonymous';
+    cors.onload = () => {
+      try {
+        const cv = document.createElement('canvas');
+        cv.width = cors.naturalWidth; cv.height = cors.naturalHeight;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(cors, 0, 0);
+        const d = ctx.getImageData(32, 0, 32, 16).data;
+        for (let a = 3; a < d.length; a += 4) {
+          if (d[a] < 128) { done(true); return; }   // any transparency -> the author drew a real hat
+        }
+        done(false);
+      } catch (e) { done(false); }
+    };
+    cors.onerror = () => done(false);
+    cors.src = url;
+  }
+
+  // skin url -> false (failed) | { hat } (loaded + whether the second layer is real). Mirrors
+  // iconResultCache so grid rebuilds are synchronous and flicker-free instead of re-probing every head.
+  const headSkinCache = new Map();
 
   function makeHeadHolder(desc, sizePx, txtCls) {
     const holder = el('div', 'ic-holder head-holder');
     holder.style.setProperty('--sz', sizePx + 'px');
-    const url = skinUrlFromTexture(desc.texture);
-    if (url) { drawHeadFace(holder, url, txtCls); return holder; }
-    const urls = faceServiceUrls(desc, 64);
-    const img = document.createElement('img');
-    img.className = 'head-face'; img.alt = ''; img.loading = 'eager';
-    let i = 0;
-    img.onerror = () => {
-      if (++i < urls.length) { img.src = urls[i]; return; }   // try the next service before giving up
-      img.remove(); if (!holder.firstChild) holder.append(el('span', txtCls || 'cell-txt', 'head'));
-    };
-    img.src = urls[0];
-    holder.append(img);
-    return holder;
-  }
+    const urls = headSkinUrls(desc).filter((u) => headSkinCache.get(u) !== false);   // skip known-bad urls
+    const paint = (url, hat) => { clear(holder); holder.append(buildHeadCube(url, hat)); };
 
-  // Draw the 8x8 face (+ hat overlay) from a skin PNG onto a crisp canvas. Cross-origin images taint the
-  // canvas, which blocks pixel READBACK but not display — so this renders fine without CORS headers.
-  function drawHeadFace(holder, skinUrl, txtCls) {
-    const cv = document.createElement('canvas');
-    cv.width = 64; cv.height = 64;           // 8px face * 8 = crisp
-    cv.className = 'head-face';
-    const ctx = cv.getContext('2d');
-    ctx.imageSmoothingEnabled = false;
-    const img = new Image();
-    img.onload = () => {
-      try {
-        ctx.clearRect(0, 0, 64, 64);
-        ctx.drawImage(img, 8, 8, 8, 8, 0, 0, 64, 64);   // face
-        ctx.drawImage(img, 40, 8, 8, 8, 0, 0, 64, 64);  // hat overlay
-      } catch (e) { /* leave whatever drew */ }
-    };
-    img.onerror = () => { cv.remove(); if (!holder.firstChild) holder.append(el('span', txtCls || 'cell-txt', 'head')); };
-    img.src = skinUrl;
-    holder.append(cv);
+    const warm = urls.length ? headSkinCache.get(urls[0]) : null;
+    if (warm) { paint(urls[0], warm.hat); return holder; }   // fully cached: build now, no probe, no blank
+
+    let i = 0;
+    (function tryNext() {
+      if (i >= urls.length) {
+        if (!holder.firstChild) holder.append(el('span', txtCls || 'cell-txt', 'head'));
+        return;
+      }
+      const url = urls[i++];
+      const hit = headSkinCache.get(url);
+      if (hit) { paint(url, hit.hat); return; }
+      const probe = new Image();   // resolve the skin first so a failed URL never paints a broken cube
+      probe.onload = () => {
+        if (probe.naturalHeight !== 32) { headSkinCache.set(url, { hat: true }); paint(url, true); return; }
+        legacyHatIsReal(url, (hat) => { headSkinCache.set(url, { hat }); paint(url, hat); });
+      };
+      probe.onerror = () => { headSkinCache.set(url, false); tryNext(); };
+      probe.src = url;
+    })();
+    return holder;
   }
 
   // head-aware icon: a head face when the item is a head, else the normal material resolver
