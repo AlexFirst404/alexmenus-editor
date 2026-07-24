@@ -56,30 +56,15 @@ export default {
     }
 
     // Live "Apply": the plugin mints a session token in-game (/am editor) and polls it; the editor pushes
-    // the edited bundle to the same token. One-shot — a successful GET consumes the pending bundle.
+    // the edited bundle to the same token. Routed to a per-token Durable Object — strongly consistent and
+    // NOT edge-cached, so the poller sees the editor's push on the very next poll (KV would make it wait out
+    // a ~30–60s negative-lookup cache). One-shot: a successful GET consumes the pending bundle.
     //   POST /apply/<token>  -> { ok: true }
     //   GET  /apply/<token>  -> the pending bundle (and clears it), or 404 when nothing is pending
     const applySession = path.match(/^apply\/([A-Za-z0-9_-]{8,64})$/);
-    if (applySession) {
-      const kvKey = "apply:" + applySession[1];
-      if (request.method === "POST") {
-        const body = await request.text();
-        if (body.length > MAX_BYTES) return json({ error: "bundle too large" }, 413);
-        try { JSON.parse(body); } catch { return json({ error: "body is not JSON" }, 400); }
-        await env.PASTES.put(kvKey, body, { expirationTtl: APPLY_TTL });
-        return json({ ok: true });
-      }
-      if (request.method === "GET") {
-        // Short cacheTtl: KV caches NEGATIVE lookups at the edge too (60s by default), which would make the
-        // plugin's poller keep seeing "nothing pending" long after the editor pushed. This shortens that
-        // window; it does not eliminate it (a Durable Object would — see README).
-        const val = await env.PASTES.get(kvKey, { cacheTtl: 30 });
-        if (val === null) return json({ error: "nothing pending" }, 404);
-        await env.PASTES.delete(kvKey);
-        return new Response(val, {
-          headers: { "Content-Type": "application/json; charset=utf-8", ...cors() },
-        });
-      }
+    if (applySession && (request.method === "POST" || request.method === "GET")) {
+      const id = env.APPLY.idFromName(applySession[1]);
+      return env.APPLY.get(id).fetch(request);
     }
 
     // Fetch a bundle by code.
@@ -97,3 +82,43 @@ export default {
     return json({ error: "bad request" }, 400);
   },
 };
+
+/**
+ * One live-apply session, keyed by the token via idFromName. Strongly consistent and single-threaded, so
+ * POST (editor pushes the bundle) and GET (plugin consumes it) never race and there is no edge cache to
+ * wait out. The bundle is one-shot: GET returns it and deletes it. A self-scheduled alarm clears an
+ * abandoned session so nothing lingers past the plugin's watch window.
+ */
+export class ApplySession {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+   try {
+    if (request.method === "POST") {
+      const body = await request.text();
+      if (body.length > MAX_BYTES) return json({ error: "bundle too large" }, 413);
+      try { JSON.parse(body); } catch { return json({ error: "body is not JSON" }, 400); }
+      await this.state.storage.put("bundle", body);
+      await this.state.storage.setAlarm(Date.now() + APPLY_TTL * 1000);   // self-clean if abandoned
+      return json({ ok: true });
+    }
+    if (request.method === "GET") {
+      const body = await this.state.storage.get("bundle");
+      if (body == null) return json({ error: "nothing pending" }, 404);
+      await this.state.storage.delete("bundle");
+      return new Response(body, {
+        headers: { "Content-Type": "application/json; charset=utf-8", ...cors() },
+      });
+    }
+    return json({ error: "bad request" }, 400);
+   } catch (e) {
+    return json({ error: "apply session error" }, 500);
+   }
+  }
+
+  async alarm() {
+    await this.state.storage.deleteAll();
+  }
+}

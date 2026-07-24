@@ -80,7 +80,9 @@ code { font-family:var(--mono); }
   background:linear-gradient(180deg, var(--accent-hover), var(--accent));
   color:#000; font-weight:600; border-color:transparent;
 }
-.btn.primary:hover { background:var(--accent-hover); }
+/* hover via filter, NOT a background swap: switching gradient->solid can't transition and flickers */
+.btn.primary:hover { filter:brightness(1.06); }
+.btn.primary:disabled { filter:none; opacity:.5; cursor:default; }
 .btn.small { padding:5px 10px; font-size:12px; }
 .btn.icon {
   width:30px; height:30px; padding:0; justify-content:center;

@@ -1841,9 +1841,34 @@
   const stripNs = (s) => String(s == null ? '' : s).replace(/^minecraft:/, '');
   const texUrl = (p) => ICON_BASE + stripNs(p) + '.png';
 
+  // Concurrency gate for model fetches: the picker resolves hundreds of blocks at once, and firing every
+  // model request in parallel makes the CDN rate-limit (429) — which is what turned blocks into flat 2D
+  // fallbacks. Cap in-flight requests so the CDN keeps answering.
+  const MODEL_MAX = 8;
+  let modelActive = 0;
+  const modelWaiters = [];
+  function modelAcquire() {
+    if (modelActive < MODEL_MAX) { modelActive++; return Promise.resolve(); }
+    return new Promise((res) => modelWaiters.push(res));
+  }
+  function modelRelease() {
+    const next = modelWaiters.shift();
+    if (next) next();               // hand the slot straight to the next waiter (count stays at max)
+    else modelActive--;
+  }
+
   function fetchModelJson(path) {
     if (modelCache.has(path)) return modelCache.get(path);
-    const p = fetch(MODEL_BASE + path + '.json').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    const p = modelAcquire().then(() => fetch(MODEL_BASE + path + '.json')
+      .then((r) => {
+        if (r.ok) return r.json();
+        if (r.status === 404) return null;             // genuinely missing -> cache the null
+        throw new Error('HTTP ' + r.status);           // 429 / 5xx when the picker hammers the CDN
+      })
+      // Transient failure: DON'T pin null (that would freeze the block as a 2D fallback for the whole
+      // session) — drop it from the cache so a later render can retry and get the real model.
+      .catch(() => { modelCache.delete(path); return null; })
+      .finally(() => modelRelease()));
     modelCache.set(path, p);
     return p;
   }
@@ -1930,8 +1955,12 @@
     // 3) block model (many blocks have no item model)
     res = (await walkModel('block/' + name)) || (await walkModel('block/' + name + '_inventory'));
     if (res && res.kind !== 'blank') return res;
-    // 4) broadened texture probe before giving up to text
-    for (const p of ['item/' + name, 'block/' + name, 'item/' + name + '_00']) {
+    // 4) broadened texture probe before giving up to text. A block texture -> CUBE (blocks must stay 3D
+    //    even when the model walk was rate-limited and returned nothing); an item texture -> flat.
+    if (await probeTexture('block/' + name)) {
+      return { kind: 'cube', top: 'block/' + name, side: 'block/' + name, front: null };
+    }
+    for (const p of ['item/' + name, 'item/' + name + '_00']) {
       if (await probeTexture(p)) return { kind: 'flat', tex: p };
     }
     return { kind: 'blank' }; // truly texture-less entity item (chest/bed/skull/banner/shield/...)
