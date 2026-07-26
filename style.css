@@ -1,5 +1,8 @@
 /* AlexMenus web editor — OLED orange/black, minimalist.
-   All colors from the token set; one orange accent used sparingly. */
+   All colors from the token set; one orange accent used sparingly.
+
+   SPACING: never hard-code paddings/gaps here — use the --sp-* scale below (and the three
+   semantic aliases --field-gap / --stack-gap / --section-gap). One scale = one rhythm. */
 
 :root {
   --bg:#000000; --panel:#0a0a0a; --panel-2:#101012; --elev:#151517;
@@ -11,9 +14,28 @@
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "JetBrains Mono", Consolas, monospace;
 
-  --topbar-h:48px;
+  /* ---- spacing scale (4px base). USE THESE, not raw px. ---- */
+  --sp-0:2px;
+  --sp-1:4px;
+  --sp-2:8px;
+  --sp-3:12px;
+  --sp-4:16px;
+  --sp-5:20px;
+  --sp-6:28px;
+  --sp-7:36px;
+  /* semantic aliases built on the scale */
+  --field-gap:var(--sp-2);     /* label -> its control */
+  --stack-gap:var(--sp-3);     /* between fields inside one group */
+  --section-gap:var(--sp-4);   /* between groups / cards */
+  --pad-panel:var(--sp-5);     /* panel inner padding */
+  --pad-card:var(--sp-3);      /* card / accordion inner padding */
+
+  --topbar-h:52px;
+  /* Column widths — LIVE VALUES, overwritten inline on <html> by the splitter module
+     (localStorage: am_w_sidebar / am_w_props). Defaults below double as the dbl-click reset. */
   --sidebar-w:240px;
-  --props-w:320px;
+  --props-w:340px;
+  --split-w:7px;               /* draggable divider column width */
 
   /* chest/inventory slot grid sizing (was 46px cell / 5px gap; ~1.5x bigger so it's comfortable at
      100% browser zoom instead of needing 160%). The grid is always 9 wide; the grid-wrap scrolls if a
@@ -56,11 +78,18 @@ body { display:flex; flex-direction:column; min-height:100vh; }
   * { transition:none !important; animation:none !important; }
 }
 
-/* scrollbars */
+/* ============ scrollbars (thin, dark, accent on hover) ============ */
 * { scrollbar-width:thin; scrollbar-color:var(--border-2) transparent; }
-*::-webkit-scrollbar { width:10px; height:10px; }
-*::-webkit-scrollbar-thumb { background:var(--border-2); border-radius:6px; }
+*:hover { scrollbar-color:var(--accent) transparent; }
+*::-webkit-scrollbar { width:9px; height:9px; }
 *::-webkit-scrollbar-track { background:transparent; }
+*::-webkit-scrollbar-corner { background:transparent; }
+*::-webkit-scrollbar-thumb {
+  background:var(--border-2); border-radius:999px;
+  border:2px solid transparent; background-clip:padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background:var(--accent); background-clip:padding-box; }
+*::-webkit-scrollbar-thumb:active { background:var(--accent-hover); background-clip:padding-box; }
 
 code { font-family:var(--mono); }
 
@@ -69,8 +98,8 @@ code { font-family:var(--mono); }
   appearance:none; cursor:pointer;
   background:var(--panel-2); color:var(--text);
   border:1px solid var(--border-2); border-radius:var(--r-sm);
-  padding:7px 13px; font:inherit; font-size:13px;
-  display:inline-flex; align-items:center; gap:8px; line-height:1;
+  padding:var(--sp-2) var(--sp-3); font:inherit; font-size:13px;
+  display:inline-flex; align-items:center; gap:var(--sp-2); line-height:1;
 }
 .btn:hover { border-color:var(--accent); color:var(--text); }
 .btn:active { transform:translateY(1px); }
@@ -83,7 +112,7 @@ code { font-family:var(--mono); }
 /* hover via filter, NOT a background swap: switching gradient->solid can't transition and flickers */
 .btn.primary:hover { filter:brightness(1.06); }
 .btn.primary:disabled { filter:none; opacity:.5; cursor:default; }
-.btn.small { padding:5px 10px; font-size:12px; }
+.btn.small { padding:var(--sp-1) var(--sp-2); font-size:12px; }
 .btn.icon {
   width:30px; height:30px; padding:0; justify-content:center;
   font-size:18px; line-height:1; color:var(--muted);
@@ -95,7 +124,7 @@ code { font-family:var(--mono); }
 .in {
   width:100%; background:var(--panel-2); color:var(--text);
   border:1px solid var(--border-2); border-radius:var(--r-sm);
-  padding:8px 10px; font:inherit; font-size:13px;
+  padding:var(--sp-2) var(--sp-3); font:inherit; font-size:13px;
 }
 .in::placeholder { color:var(--faint); }
 .in:focus {
@@ -126,14 +155,67 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .muted { color:var(--muted); }
 .faint { color:var(--faint); font-size:12.5px; }
 
+/* ============ number steppers (custom ▲/▼ pair, native spinners killed) ============
+   Expected DOM (built by app.js — enhanceNumbers()):
+
+     <div class="num-wrap">                      <- replaces the bare input in the DOM
+       <input type="number" class="in" id="…">   <- the ORIGINAL input, untouched (id/handlers kept)
+       <span class="num-steps" aria-hidden="true">
+         <button type="button" class="num-step up"   tabindex="-1"></button>
+         <button type="button" class="num-step down" tabindex="-1"></button>
+       </span>
+     </div>
+
+   Modifiers: .num-wrap.compact (narrow fields, e.g. «Рядов»), .num-step[disabled] / .num-step.is-disabled
+   (at min/max). The arrows are pure CSS triangles — no glyph, no font dependency. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance:none; appearance:none; margin:0; }
+input[type="number"] { -moz-appearance:textfield; appearance:textfield; }
+
+.num-wrap { position:relative; display:flex; align-items:stretch; min-width:0; }
+.num-wrap > .in { width:100%; padding-right:30px; }
+.num-wrap.compact > .in { padding-right:26px; }
+
+.num-steps {
+  position:absolute; top:3px; right:3px; bottom:3px; width:22px;
+  display:flex; flex-direction:column; gap:2px; pointer-events:none;
+}
+.num-wrap.compact .num-steps { width:19px; }
+.num-step {
+  pointer-events:auto;
+  flex:1 1 0; min-height:0; padding:0;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--elev); color:var(--muted);
+  border:1px solid var(--border); border-radius:var(--r-xs);
+  cursor:pointer; appearance:none; font:inherit;
+  transition:background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.num-step::before {
+  content:''; display:block; width:0; height:0;
+  border-left:4px solid transparent; border-right:4px solid transparent;
+}
+.num-step.up::before   { border-bottom:5px solid currentColor; }
+.num-step.down::before { border-top:5px solid currentColor; }
+.num-step:hover { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
+.num-step:active { color:#000; background:var(--accent); border-color:var(--accent); }
+.num-step:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.num-step[disabled], .num-step.is-disabled {
+  opacity:.3; cursor:default; pointer-events:none;
+  color:var(--faint); background:var(--panel-2); border-color:var(--border);
+}
+.num-wrap:focus-within .num-step { color:var(--text); border-color:var(--border-2); }
+.num-wrap:focus-within .num-step:hover { color:var(--accent); border-color:var(--accent); }
+.num-wrap:focus-within .num-step[disabled],
+.num-wrap:focus-within .num-step.is-disabled { color:var(--faint); }
+
 /* ============ top bar ============ */
 .topbar {
   height:var(--topbar-h); flex:0 0 var(--topbar-h);
   display:flex; align-items:center; justify-content:space-between;
-  padding:0 16px; border-bottom:1px solid var(--border);
+  padding:0 var(--sp-5); border-bottom:1px solid var(--border);
   background:var(--panel);
 }
-.brand { display:flex; align-items:center; gap:8px; min-width:0; }
+.brand { display:flex; align-items:center; gap:var(--sp-2); min-width:0; }
 .brand .dot {
   width:9px; height:9px; border-radius:50%;
   background:var(--accent); box-shadow:0 0 8px var(--accent-soft);
@@ -145,7 +227,7 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
   color:var(--muted); font-family:var(--mono); font-size:13px;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
-.top-actions { display:flex; align-items:center; gap:10px; }
+.top-actions { display:flex; align-items:center; gap:var(--sp-3); }
 
 /* raw-yaml toggle */
 .toggle { color:var(--muted); }
@@ -163,43 +245,73 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .toggle[aria-pressed="true"] .tog-box { background:var(--accent-soft); border-color:var(--accent); }
 .toggle[aria-pressed="true"] .tog-box::after { left:14px; background:var(--accent); }
 
-/* ============ layout ============ */
+/* ============ layout ============
+   5 grid tracks: sidebar | splitter | center | splitter | props.
+   The two splitter columns are fixed at --split-w; the panels are resized by writing
+   --sidebar-w / --props-w on <html> (splitter module in app.js).
+   NB: minmax(0,1fr) — the center MUST be allowed to shrink below the slot grid's intrinsic
+   width, otherwise dragging a splitter inwards would blow the grid out instead of scrolling. */
 .layout {
   flex:1 1 auto; min-height:0;
   display:grid;
-  grid-template-columns:var(--sidebar-w) 1fr var(--props-w);
+  grid-template-columns:var(--sidebar-w) var(--split-w) minmax(0,1fr) var(--split-w) var(--props-w);
 }
 .layout.raw-mode .props,
 .layout.graph-mode .props,
-.layout.reqedit-mode .props { display:none; }
+.layout.reqedit-mode .props,
+.layout.raw-mode .split-right,
+.layout.graph-mode .split-right,
+.layout.reqedit-mode .split-right { display:none; }
 .layout.raw-mode .center,
 .layout.graph-mode .center,
-.layout.reqedit-mode .center { grid-column:2 / 4; }
-.layout.raw-mode .center-toolbar,
-.layout.raw-mode .menu-settings,
-.layout.raw-mode .grid-wrap,
-.layout.graph-mode .center-toolbar,
-.layout.graph-mode .menu-settings,
-.layout.graph-mode .grid-wrap,
-.layout.reqedit-mode .center-toolbar,
-.layout.reqedit-mode .menu-settings,
-.layout.reqedit-mode .grid-wrap { display:none; }
+.layout.reqedit-mode .center { grid-column:3 / 6; }
+.layout.raw-mode .center-scroll,
+.layout.graph-mode .center-scroll,
+.layout.reqedit-mode .center-scroll { display:none; }
+
+/* ============ splitters (draggable column dividers) ============ */
+.splitter {
+  position:relative; z-index:5;
+  background:var(--bg);
+  cursor:col-resize;
+  touch-action:none;                       /* pointer events, incl. touch drag */
+  user-select:none; -webkit-user-select:none;
+  transition:background-color 120ms ease;
+}
+/* wider invisible hit area than the visible 7px strip */
+.splitter::before { content:''; position:absolute; top:0; bottom:0; left:-4px; right:-4px; }
+/* grip pill */
+.splitter::after {
+  content:''; position:absolute; top:50%; left:50%;
+  transform:translate(-50%, -50%);
+  width:2px; height:30px; border-radius:999px;
+  background:var(--border-2);
+  transition:background-color 120ms ease, height 140ms ease;
+}
+.splitter:hover, .splitter:focus-visible, .splitter.is-dragging { background:var(--accent); }
+.splitter:hover::after, .splitter:focus-visible::after, .splitter.is-dragging::after {
+  background:#000; height:64px;
+}
+.splitter:focus-visible { outline:none; }
+/* while dragging: no text selection anywhere, col-resize cursor everywhere */
+body.is-resizing { cursor:col-resize; user-select:none; -webkit-user-select:none; }
+body.is-resizing * { cursor:col-resize !important; }
 
 /* ============ sidebar ============ */
 .sidebar {
   border-right:1px solid var(--border); background:var(--panel);
-  display:flex; flex-direction:column; min-height:0;
+  display:flex; flex-direction:column; min-height:0; min-width:0;
 }
 .side-head {
   display:flex; align-items:center; justify-content:space-between;
-  padding:12px 14px; border-bottom:1px solid var(--border);
+  padding:var(--sp-3) var(--sp-4); border-bottom:1px solid var(--border);
 }
 .side-title { font-weight:600; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }
-.menu-list { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1 1 auto; min-height:0; }
+.menu-list { list-style:none; margin:0; padding:var(--sp-2); overflow-y:auto; flex:1 1 auto; min-height:0; }
 .menu-item {
-  display:flex; align-items:center; gap:8px; justify-content:space-between;
-  padding:9px 11px; border-radius:var(--r-sm); cursor:pointer;
-  border-left:3px solid transparent; margin-bottom:3px;
+  display:flex; align-items:center; gap:var(--sp-2); justify-content:space-between;
+  padding:var(--sp-2) var(--sp-3); border-radius:var(--r-sm); cursor:pointer;
+  border-left:3px solid transparent; margin-bottom:var(--sp-1);
   color:var(--text);
 }
 .menu-item:hover { background:var(--panel-2); }
@@ -211,25 +323,44 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
   flex:0 0 auto;
 }
 .side-foot {
-  display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--border);
+  display:flex; gap:var(--sp-2); padding:var(--sp-3); border-top:1px solid var(--border);
 }
-.side-foot .btn { flex:1; justify-content:center; }
+.side-foot .btn { flex:1; justify-content:center; min-width:0; }
 
-/* ============ center ============ */
-.center { display:flex; flex-direction:column; min-height:0; overflow:hidden; }
-.center-toolbar {
-  display:flex; gap:12px; align-items:flex-end;
-  padding:14px 18px; border-bottom:1px solid var(--border);
+/* ============ center ============
+   .center is the mode host (grid / raw / graph / reqedit take turns filling it).
+   .center-scroll is the ONE scroll container for the grid mode — toolbar + menu-settings +
+   grid live inside it, so opening «Настройки меню» scrolls the whole column with the wheel
+   instead of being clipped by .center's overflow:hidden. */
+.center { display:flex; flex-direction:column; min-height:0; min-width:0; overflow:hidden; }
+.center-scroll {
+  flex:1 1 auto; min-height:0; min-width:0;
+  overflow-y:auto; overflow-x:hidden;
+  display:flex; flex-direction:column;
+  scroll-behavior:smooth;
 }
-.field { display:flex; flex-direction:column; gap:5px; }
+.center-toolbar {
+  position:sticky; top:0; z-index:4; flex:0 0 auto;
+  display:flex; gap:var(--sp-4); align-items:flex-end;
+  padding:var(--sp-4) var(--sp-5);
+  border-bottom:1px solid var(--border); background:var(--bg);
+}
+.field { display:flex; flex-direction:column; gap:var(--field-gap); min-width:0; }
 .field.grow { flex:1 1 auto; }
-.rows-field { width:90px; flex:0 0 auto; }
+.rows-field { width:104px; flex:0 0 auto; }
 .lbl { font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
 
-.grid-wrap { flex:1 1 auto; overflow:auto; padding:22px; display:flex; flex-direction:column; align-items:center; }
+/* flex:1 0 auto + no shrink: the grid keeps its intrinsic height and .center-scroll takes over
+   vertical scrolling; only sideways overflow is handled locally. */
+.grid-wrap {
+  flex:1 0 auto; overflow:auto;
+  padding:var(--sp-6) var(--sp-5);
+  display:flex; flex-direction:column;
+  align-items:center; align-items:safe center;   /* "safe" keeps the left edge reachable when it overflows */
+}
 .slot-grid {
   display:grid; grid-template-columns:repeat(9, var(--cell)); gap:var(--cell-gap);
-  justify-content:center; padding:14px;
+  justify-content:center; padding:var(--sp-4);
   background:var(--panel); border:1px solid var(--border); border-radius:var(--r);
   user-select:none; -webkit-user-select:none; /* keep drag-select from selecting text */
 }
@@ -278,10 +409,10 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
   margin-top:calc(var(--s) / -2); margin-left:calc(var(--s) / -2);
 }
 .ic-holder .head3d .cube.hat { transform:rotateX(-26deg) rotateY(45deg) scale(1.09); }
-.head-fields { display:flex; flex-direction:column; gap:6px; }
-.head-fields .lbl { margin-bottom:2px; }
+.head-fields { display:flex; flex-direction:column; gap:var(--sp-2); }
+.head-fields .lbl { margin-bottom:var(--sp-0); }
 
-/* 1..100 speed slider (open-animation) */
+/* speed slider (open-animation) */
 .in.range {
   -webkit-appearance:none; appearance:none;
   width:100%; height:26px; padding:0; border:0; background:transparent; cursor:pointer;
@@ -298,6 +429,12 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 }
 .in.range:focus { outline:none; }
 .in.range:focus::-webkit-slider-thumb { box-shadow:0 0 0 3px var(--accent-soft); }
+/* tick marks / scale under a range (e.g. 100% = normal, 200% = double speed) */
+.range-scale {
+  display:flex; justify-content:space-between;
+  font-size:10.5px; color:var(--faint); font-family:var(--mono);
+  margin-top:calc(var(--sp-1) * -1);
+}
 .ic-holder .cube {
   --s:calc(var(--sz) * .56);
   position:relative; width:var(--s); height:var(--s);
@@ -311,18 +448,18 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .ic-holder .cube .left  { transform:rotateY(-90deg) translateZ(calc(var(--s) / 2)); filter:brightness(.62); }
 .ic-holder .cube .right { transform:translateZ(calc(var(--s) / 2)); filter:brightness(.82); }
 
-.grid-hint { color:var(--faint); font-size:12px; margin:16px 0 0; }
+.grid-hint { color:var(--faint); font-size:12px; margin:var(--sp-5) 0 0; }
 
 /* selection counter in the center toolbar */
 .sel-count {
   align-self:center; white-space:nowrap;
   font-size:11.5px; color:var(--accent);
   background:var(--accent-soft); border:1px solid var(--accent);
-  border-radius:999px; padding:4px 11px;
+  border-radius:999px; padding:var(--sp-1) var(--sp-3);
 }
 
 /* raw yaml */
-.raw-wrap { flex:1 1 auto; display:flex; flex-direction:column; padding:14px 18px; min-height:0; }
+.raw-wrap { flex:1 1 auto; display:flex; flex-direction:column; padding:var(--sp-4) var(--sp-5); min-height:0; }
 /* IDE-style editor: line-number gutter + highlighted <pre> under a transparent <textarea> */
 .raw-editor {
   flex:1 1 auto; display:flex; min-height:0; overflow:hidden;
@@ -352,19 +489,19 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .raw-hl .yc { color:#6b6b73; font-style:italic; }  /* comment */
 .raw-hl .yp { color:#c58ae0; }               /* punctuation (: -) */
 .raw-err {
-  margin-top:10px; color:var(--danger); font-family:var(--mono);
+  margin-top:var(--sp-3); color:var(--danger); font-family:var(--mono);
   font-size:12.5px; border:1px solid var(--danger); border-radius:var(--r-sm);
-  padding:8px 11px; background:rgba(255,81,105,.06);
+  padding:var(--sp-2) var(--sp-3); background:rgba(255,81,105,.06);
 }
 
 /* ============ menu-settings (collapsible top-level keys) ============ */
-.menu-settings { border-bottom:1px solid var(--border); padding:10px 18px; }
+.menu-settings { flex:0 0 auto; border-bottom:1px solid var(--border); padding:var(--sp-4) var(--sp-5); }
 .menu-settings > summary {
   cursor:pointer; list-style:none; user-select:none;
-  display:inline-flex; align-items:center; gap:8px;
+  display:inline-flex; align-items:center; gap:var(--sp-2);
   font-size:12px; font-weight:600; color:var(--text);
   text-transform:uppercase; letter-spacing:.5px;
-  padding:8px 14px; border:1px solid var(--border-2); border-radius:var(--r-xs);
+  padding:var(--sp-2) var(--sp-4); border:1px solid var(--border-2); border-radius:var(--r-xs);
   background:var(--panel-2);
 }
 .menu-settings > summary:hover { border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
@@ -374,16 +511,102 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
   content:'▸'; color:currentColor; font-size:11px; transition:transform 120ms ease;
 }
 .menu-settings[open] > summary::before { content:'▾'; }
-.ms-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; padding:12px 0 4px; }
+.ms-grid {
+  display:grid; grid-template-columns:1fr 1fr;
+  gap:var(--section-gap) var(--sp-5);
+  padding:var(--sp-5) 0 var(--sp-2);
+}
 .ms-grid .ms-wide { grid-column:1 / -1; }
 .ms-grid .ms-help { grid-column:1 / -1; }
+/* separator above the "big" grouped keys so they don't read as one soup of inputs */
+.ms-grid .ms-sep { grid-column:1 / -1; height:1px; background:var(--border); margin:var(--sp-1) 0; }
 /* nested key-groups inside menu-settings (open-item / open-animation) */
 .ms-subgrid {
-  display:grid; grid-template-columns:1fr 1fr; gap:9px 12px;
-  margin-top:7px; padding:9px 10px;
+  display:grid; grid-template-columns:1fr 1fr; gap:var(--stack-gap) var(--sp-4);
+  margin-top:var(--sp-2); padding:var(--sp-3);
   background:var(--panel-2); border:1px solid var(--border); border-radius:var(--r-sm);
 }
 .ms-subgrid .ms-sub-full { grid-column:1 / -1; }
+/* inside an accordion the card chrome is already provided by .acc — drop the inner box */
+.acc .ms-subgrid { margin-top:0; padding:0; background:transparent; border:0; }
+
+/* ============ accordions ============
+   Used by the right props panel and by the grouped menu-settings keys.
+
+     <section class="acc" data-acc="<storage-key>" data-open="true|false" [data-autohide]>
+       <button class="acc-head" type="button" aria-expanded="…" aria-controls="acc-<key>-body">
+         <span class="acc-chev" aria-hidden="true"></span>
+         <span class="acc-title">Заголовок</span>
+         <span class="acc-sub">подпись</span>          (optional)
+       </button>
+       <div class="acc-body" id="acc-<key>-body" role="region" aria-labelledby="…">
+         <div class="acc-fields"> …контент… </div>
+       </div>
+     </section>
+
+   Collapse is a 0fr->1fr grid-row animation, NOT display:none — every input inside stays in the
+   DOM and keeps returning its .value, so app.js can read/write fields in a closed section. */
+.acc {
+  border:1px solid var(--border); border-radius:var(--r-sm);
+  background:var(--panel-2); min-width:0;
+}
+.acc-head {
+  width:100%; display:flex; align-items:center; gap:var(--sp-2);
+  padding:var(--sp-3); margin:0;
+  background:transparent; border:0; border-radius:var(--r-sm);
+  color:var(--text); font:inherit; text-align:left; cursor:pointer;
+  transition:color 120ms ease;
+}
+.acc-head:hover .acc-title, .acc-head:hover .acc-chev { color:var(--accent); }
+.acc-head:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.acc-chev {
+  flex:0 0 auto; width:12px; height:12px; position:relative; color:var(--faint);
+  transition:transform 180ms ease, color 120ms ease;
+}
+.acc-chev::before {
+  content:''; position:absolute; top:50%; left:50%;
+  width:5px; height:5px; margin:-3px 0 0 -4px;
+  border-right:1.6px solid currentColor; border-bottom:1.6px solid currentColor;
+  transform:rotate(-45deg);                        /* ▸ when closed */
+}
+.acc[data-open="true"] .acc-chev { transform:rotate(90deg); color:var(--accent); }  /* ▾ when open */
+.acc-title {
+  flex:1 1 auto; min-width:0;
+  font-size:11.5px; font-weight:600; letter-spacing:.5px; text-transform:uppercase;
+  color:var(--muted); transition:color 120ms ease;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.acc[data-open="true"] .acc-title { color:var(--text); }
+.acc-sub {
+  flex:0 0 auto; font-size:11px; color:var(--faint);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:45%;
+}
+.acc-body {
+  display:grid; grid-template-rows:0fr;
+  transition:grid-template-rows 200ms ease;
+}
+.acc[data-open="true"] .acc-body { grid-template-rows:1fr; }
+/* min-height:0 + overflow:hidden is what makes the 0fr row actually collapse.
+   visibility (delayed on close) drops the collapsed controls out of the tab order without
+   ever using display:none, so .value stays readable from JS. */
+.acc-inner {
+  min-height:0; overflow:hidden;
+  visibility:hidden; transition:visibility 0s linear 200ms;
+}
+.acc[data-open="true"] .acc-inner { visibility:visible; transition-delay:0s; }
+/* .acc-fields is the normal content box. The two data-autohide sections keep their JS-owned
+   element (#f-input-wrap / #f-head-fields) as the DIRECT child of .acc-inner — the :has() rule
+   below needs that — so they get the same padding through this second selector. */
+.acc-fields,
+.acc-inner > .input-wrap,
+.acc-inner > .head-fields {
+  display:flex; flex-direction:column; gap:var(--stack-gap);
+  padding:var(--sp-3) var(--sp-3) var(--sp-4);
+  border-top:1px solid var(--border);
+}
+/* dynamic sections (input-slot editor, player head) whose only child app.js toggles with [hidden]:
+   fold the whole accordion away so no orphan header is left behind. */
+.acc[data-autohide]:has(> .acc-body > .acc-inner > [hidden]) { display:none; }
 
 /* ============ navigation graph ============ */
 .graph-wrap { flex:1 1 auto; position:relative; min-height:0; overflow:hidden; background:var(--panel); }
@@ -407,16 +630,29 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 /* ============ right props ============ */
 .props {
   border-left:1px solid var(--border); background:var(--panel);
-  overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:14px;
+  overflow-y:auto; min-width:0;
+  padding:var(--pad-panel) var(--sp-4) var(--sp-7);
+  display:flex; flex-direction:column; gap:var(--section-gap);
 }
-.props-empty { padding:22px 6px; }
-.props-empty p { margin:0 0 8px; }
-.props-body { display:flex; flex-direction:column; gap:14px; }
-.props-head { display:flex; align-items:center; justify-content:space-between; }
+.props-empty { padding:var(--sp-6) var(--sp-2); }
+.props-empty p { margin:0 0 var(--sp-3); }
+.props-body { display:flex; flex-direction:column; gap:var(--section-gap); }
+.props-head {
+  display:flex; align-items:center; justify-content:space-between; gap:var(--sp-3);
+  padding-bottom:var(--sp-3); border-bottom:1px solid var(--border);
+}
 .props-title { font-weight:600; }
 .props-title b { color:var(--accent); font-family:var(--mono); }
+/* the one section that is NEVER collapsed — материал drives everything below it */
+.props-key {
+  border:1px solid var(--border); border-radius:var(--r-sm);
+  background:var(--panel-2); padding:var(--sp-3);
+}
+/* the stack of accordions below the material field */
+.slot-rest { display:flex; flex-direction:column; gap:var(--stack-gap); min-width:0; }
 
-.mat-row { display:flex; align-items:center; gap:8px; }
+.mat-row { display:flex; align-items:center; gap:var(--sp-2); flex-wrap:wrap; }
+.mat-row > .in { flex:1 1 120px; min-width:0; }
 .mat-ic {
   width:32px; height:32px; flex:0 0 auto; border-radius:var(--r-xs);
   background:var(--panel-2); border:1px solid var(--border);
@@ -429,37 +665,52 @@ input[type="checkbox"]:disabled { opacity:.5; cursor:default; }
 .bulk-banner {
   font-size:12px; color:var(--accent);
   background:var(--accent-soft); border:1px solid var(--accent);
-  border-radius:var(--r-sm); padding:7px 11px;
+  border-radius:var(--r-sm); padding:var(--sp-2) var(--sp-3);
 }
 
-.flags { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; margin-bottom:8px; }
-.check { display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted); cursor:pointer; }
+.flags { display:grid; grid-template-columns:1fr 1fr; gap:var(--sp-2) var(--sp-4); margin:0;
+         transition:opacity 140ms ease; }
+/* «Скрыть всё (hide-all)» is on -> the eight individual flags below it change nothing in game.
+   renderFlags() dims them (they stay clickable — the values are kept for when hide-all goes off). */
+.flags.is-dimmed { opacity:.42; }
+.check { display:flex; align-items:center; gap:var(--sp-2); font-size:12.5px; color:var(--muted); cursor:pointer; }
 .check input { flex:0 0 auto; }
-.check.hideall { color:var(--text); }
+.check.hideall {
+  color:var(--text); font-size:13px;
+  padding:var(--sp-2) var(--sp-3);
+  border:1px solid var(--border-2); border-radius:var(--r-sm); background:var(--panel);
+}
+.check.hideall:hover { border-color:var(--accent); }
+.check.hideall:has(input:checked) { border-color:var(--accent); color:var(--accent); }
+/* slot-mode tab row */
+.slot-mode { gap:var(--sp-2); }
+.slot-mode .mat-row .btn { flex:1 1 auto; justify-content:center; }
+.input-wrap { gap:var(--stack-gap); }
+.clicks-head { display:flex; align-items:center; justify-content:space-between; gap:var(--sp-2); }
 
 /* clicks editor */
-.clicks { display:flex; flex-direction:column; gap:10px; }
+.clicks { display:flex; flex-direction:column; gap:var(--stack-gap); }
 .click-kind {
   border:1px solid var(--border); border-radius:var(--r-sm);
   background:var(--panel-2); overflow:hidden;
 }
 .ck-head {
-  display:flex; align-items:center; justify-content:space-between;
-  padding:8px 10px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between; gap:var(--sp-2);
+  padding:var(--sp-2) var(--sp-3); border-bottom:1px solid var(--border);
 }
 .ck-name { font-size:12px; font-weight:600; }
 .ck-name.empty { color:var(--faint); font-weight:500; }
-.ck-body { display:flex; flex-direction:column; gap:8px; padding:9px 10px; }
+.ck-body { display:flex; flex-direction:column; gap:var(--stack-gap); padding:var(--sp-3); }
 .action-row {
-  display:flex; flex-direction:column; gap:6px;
+  display:flex; flex-direction:column; gap:var(--sp-2);
   border:1px solid var(--border); border-radius:var(--r-xs);
-  padding:8px; background:var(--panel);
+  padding:var(--sp-3); background:var(--panel);
 }
-.action-top { display:flex; gap:6px; align-items:center; }
-.action-top select { flex:1 1 auto; }
+.action-top { display:flex; gap:var(--sp-2); align-items:center; }
+.action-top select { flex:1 1 auto; min-width:0; }
 .action-top .btn.icon { width:26px; height:26px; font-size:15px; }
-.action-fields { display:flex; flex-direction:column; gap:6px; }
-.action-fields .in { font-size:12.5px; padding:6px 8px; }
+.action-fields { display:flex; flex-direction:column; gap:var(--sp-2); }
+.action-fields .in { font-size:12.5px; padding:var(--sp-2); }
 .action-fields .in.area { min-height:64px; }
 .add-action {
   align-self:flex-start; font-size:12px; color:var(--muted);
@@ -472,57 +723,60 @@ select.in { appearance:none;
   background-position:calc(100% - 15px) center, calc(100% - 10px) center;
   background-size:5px 5px, 5px 5px; background-repeat:no-repeat; padding-right:28px;
 }
-.inline { display:flex; gap:6px; }
-.inline .field { flex:1; }
+.inline { display:flex; gap:var(--sp-2); }
+.inline .field { flex:1; min-width:0; }
 
 /* ============ requirements (view / click / open) ============ */
-.req-section { gap:10px; }
+.req-section { gap:var(--stack-gap); }
 .req-group {
-  display:flex; flex-direction:column; gap:8px; margin-top:2px;
+  display:flex; flex-direction:column; gap:var(--stack-gap);
   border:1px solid var(--border); border-radius:var(--r-sm);
-  background:var(--panel-2); padding:9px 10px;
+  background:var(--panel-2); padding:var(--sp-3);
 }
+.acc .req-group { background:var(--panel); }
 .req-group-lbl, .req-sub-lbl {
   font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px;
 }
-.req-sub-lbl { margin-top:2px; }
-.req-builder { display:flex; flex-direction:column; gap:7px; }
-.req-ctrls { display:flex; gap:6px; align-items:center; }
-.req-ctrls select { flex:1 1 auto; }
+.req-sub-lbl { margin-top:var(--sp-0); }
+.req-builder { display:flex; flex-direction:column; gap:var(--sp-2); }
+.req-ctrls { display:flex; gap:var(--sp-2); align-items:center; }
+.req-ctrls select { flex:1 1 auto; min-width:0; }
 .req-raw-toggle { flex:0 0 auto; color:var(--muted); }
 .req-raw-toggle[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
-.req-fields { display:flex; flex-direction:column; gap:6px; }
-.req-fields .in { font-size:12.5px; padding:6px 8px; }
-.req-negate { margin-top:1px; }
+.req-fields { display:flex; flex-direction:column; gap:var(--sp-2); }
+.req-fields .in { font-size:12.5px; padding:var(--sp-2); }
+.req-negate { margin-top:var(--sp-0); }
 .req-raw .in.area { min-height:74px; }
-.req-raw-err { margin-top:6px; color:var(--danger); font-family:var(--mono); font-size:12px; }
-.req-block { display:flex; flex-direction:column; gap:7px; }
-.req-actions { display:flex; flex-direction:column; gap:7px; }
+.req-raw-err { margin-top:var(--sp-2); color:var(--danger); font-family:var(--mono); font-size:12px; }
+.req-block { display:flex; flex-direction:column; gap:var(--sp-2); }
+.req-actions { display:flex; flex-direction:column; gap:var(--sp-2); }
 .req-actions .action-row { background:var(--panel); }
-.req-success { border-top:1px dashed var(--border); padding-top:6px; }
+.req-success { border-top:1px dashed var(--border); padding-top:var(--sp-2); }
 .req-success > summary {
   cursor:pointer; list-style:none; user-select:none;
   font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:.4px;
 }
+.req-success > summary:hover { color:var(--accent); }
 .req-success > summary::-webkit-details-marker { display:none; }
 .req-success > summary::before { content:'▸'; margin-right:6px; font-size:9px; }
 .req-success[open] > summary::before { content:'▾'; }
-.req-success .req-actions { margin-top:7px; }
+.req-success .req-actions { margin-top:var(--sp-2); }
 
 /* ============ requirement node-graph editor («🔗 Граф») ============ */
-.req-editor { display:flex; flex-direction:column; gap:8px; }
-.req-mode-bar { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+.req-editor { display:flex; flex-direction:column; gap:var(--sp-3); }
+.req-editor-body { display:flex; flex-direction:column; gap:var(--sp-3); }
+.req-mode-bar { display:flex; align-items:center; justify-content:space-between; gap:var(--sp-2); flex-wrap:wrap; }
 .req-mode-lbl { flex:1 1 auto; min-width:0; font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:.4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.req-mode-btns { display:flex; align-items:center; gap:6px; flex:0 0 auto; }
+.req-mode-btns { display:flex; align-items:center; gap:var(--sp-2); flex:0 0 auto; }
 .req-graph-toggle { flex:0 0 auto; color:var(--muted); }
 .req-graph-toggle[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
 .req-full-toggle { flex:0 0 auto; color:var(--muted); }
 .req-full-toggle:hover { color:var(--accent); }
 
-.rg-host { display:flex; flex-direction:column; gap:8px; }
-.rg-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.rg-host { display:flex; flex-direction:column; gap:var(--sp-3); }
+.rg-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:var(--sp-2); }
 .rg-tb-lbl { font-size:11px; color:var(--faint); flex:1 1 auto; }
-.rg-toolbar .btn.small { padding:4px 9px; }
+.rg-toolbar .btn.small { padding:var(--sp-1) var(--sp-2); }
 
 .rg-canvas {
   overflow:auto; max-height:320px; min-height:130px;
@@ -544,11 +798,11 @@ select.in { appearance:none;
 .rgnode.logic .rgsub { fill:var(--accent); opacity:.85; }
 
 .rg-inspector {
-  display:flex; flex-direction:column; gap:7px;
+  display:flex; flex-direction:column; gap:var(--sp-2);
   border:1px solid var(--border); border-radius:var(--r-sm);
-  background:var(--panel-2); padding:9px 10px;
+  background:var(--panel-2); padding:var(--sp-3);
 }
-.rg-ins-head { display:flex; align-items:center; gap:8px; min-width:0; }
+.rg-ins-head { display:flex; align-items:center; gap:var(--sp-2); min-width:0; }
 .rg-ins-kind {
   flex:0 0 auto; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.4px;
   padding:2px 8px; border-radius:999px;
@@ -556,27 +810,47 @@ select.in { appearance:none;
 .rg-ins-kind.leaf { color:var(--muted); border:1px solid var(--border-2); }
 .rg-ins-kind.logic { color:var(--accent); border:1px solid var(--accent); background:var(--accent-soft); }
 .rg-ins-sum { font-size:12px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.rg-ins-row { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
-.rg-ins-row .btn.small { padding:4px 9px; }
+.rg-ins-row { display:flex; flex-wrap:wrap; align-items:center; gap:var(--sp-2); }
+.rg-ins-row .btn.small { padding:var(--sp-1) var(--sp-2); }
 .rg-ins-lbl { flex:0 0 auto; font-size:11px; color:var(--faint); }
 .rg-ins-hint { font-size:11px; color:var(--faint); line-height:1.35; }
+.outcome-list { display:flex; flex-direction:column; gap:var(--sp-2); }
+.input-accept { display:flex; flex-direction:column; gap:var(--sp-2); }
+/* parser-rule callout at the top of the input-slot editor (built by renderInputEditor).
+   It used to carry a hardcoded inline style; keeping it here puts it on the spacing scale. */
+.input-warn {
+  display:flex; flex-direction:column; gap:var(--sp-1);
+  margin:0; padding:var(--sp-2) var(--sp-3);
+  font-size:12px; line-height:1.35; color:var(--muted);
+  border:1px solid var(--border); border-left:2px solid var(--accent);
+  border-radius:var(--r-xs);
+}
+
+/* input-slot marker in the grid: dashed cell + a small ⇩ badge (markInputCell).
+   NOT a box-shadow — that would fight the .selected / .active rings. */
+.cell.input-slot { border-style:dashed; }
+.cell-input-badge {
+  position:absolute; right:3px; bottom:2px;
+  font-size:11px; line-height:1; color:var(--accent);
+  font-family:var(--mono); pointer-events:none;
+}
 
 /* ============ full-screen requirement editor («⛶ На весь экран») ============ */
 /* Takes over the center area like .graph-wrap / .raw-wrap (see .layout.reqedit-mode rules above). */
 .reqedit-wrap {
   flex:1 1 auto; min-height:0;
-  display:flex; flex-direction:column; gap:12px;
-  padding:16px 18px;
+  display:flex; flex-direction:column; gap:var(--sp-4);
+  padding:var(--sp-5);
 }
-.reqedit-head { display:flex; align-items:center; gap:14px; flex:0 0 auto; }
+.reqedit-head { display:flex; align-items:center; gap:var(--sp-4); flex:0 0 auto; }
 .reqedit-back { flex:0 0 auto; }
-.reqedit-titles { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.reqedit-titles { display:flex; flex-direction:column; gap:var(--sp-0); min-width:0; }
 .reqedit-title { font-weight:600; font-size:15px; }
 .reqedit-sub {
   font-size:12px; color:var(--muted); font-family:var(--mono);
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
-.reqedit-tabs { display:flex; gap:8px; flex:0 0 auto; flex-wrap:wrap; }
+.reqedit-tabs { display:flex; gap:var(--sp-2); flex:0 0 auto; flex-wrap:wrap; }
 .reqedit-tab { color:var(--muted); }
 .reqedit-tab.active { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
 
@@ -585,7 +859,7 @@ select.in { appearance:none;
    class directly to the body host, so these are compound selectors on the body, not child combinators) */
 .reqedit-body.req-builder,
 .reqedit-body.reqedit-raw { max-width:660px; }
-.reqedit-raw { display:flex; flex-direction:column; gap:8px; }
+.reqedit-raw { display:flex; flex-direction:column; gap:var(--sp-3); }
 .reqedit-raw-area { flex:1 1 auto; min-height:320px; resize:vertical; }
 
 /* graph tab: fill the whole area and give the canvas real room (vs the cramped 320px inline canvas).
@@ -596,20 +870,20 @@ select.in { appearance:none;
 /* ============ empty / loading ============ */
 .empty-state, .loading {
   flex:1 1 auto; display:flex; align-items:center; justify-content:center;
-  flex-direction:column; gap:16px; padding:24px;
+  flex-direction:column; gap:var(--sp-4); padding:var(--sp-6);
 }
 .es-card {
   max-width:460px; width:100%;
   background:var(--panel); border:1px solid var(--border);
-  border-radius:var(--r); padding:28px 30px;
+  border-radius:var(--r); padding:var(--sp-6) var(--sp-7);
 }
-.brand.big { gap:10px; margin-bottom:14px; }
+.brand.big { gap:var(--sp-3); margin-bottom:var(--sp-4); }
 .brand.big .dot { width:12px; height:12px; }
 .brand.big .wordmark { font-size:20px; }
-.es-card h1 { font-size:18px; margin:0 0 8px; font-weight:600; }
-.es-card p { margin:0 0 14px; }
+.es-card h1 { font-size:18px; margin:0 0 var(--sp-2); font-weight:600; }
+.es-card p { margin:0 0 var(--sp-4); }
 .es-steps { margin:0; padding-left:20px; color:var(--muted); font-size:13px; }
-.es-steps li { margin-bottom:8px; }
+.es-steps li { margin-bottom:var(--sp-2); }
 .es-steps code {
   background:var(--panel-2); border:1px solid var(--border-2);
   padding:1px 6px; border-radius:var(--r-xs); color:var(--text); font-size:12.5px;
@@ -626,40 +900,40 @@ select.in { appearance:none;
 .ctx-menu {
   position:fixed; z-index:70; min-width:210px;
   background:var(--elev); border:1px solid var(--border-2);
-  border-radius:var(--r-sm); padding:5px;
+  border-radius:var(--r-sm); padding:var(--sp-1);
   box-shadow:0 12px 34px rgba(0,0,0,.6);
   display:flex; flex-direction:column; gap:1px;
 }
 .ctx-item {
-  padding:8px 11px; border-radius:var(--r-xs);
+  padding:var(--sp-2) var(--sp-3); border-radius:var(--r-xs);
   font-size:13px; color:var(--text); cursor:pointer; white-space:nowrap;
 }
 .ctx-item:hover { background:var(--accent); color:#000; }
 .ctx-item.disabled { color:var(--faint); cursor:default; pointer-events:none; }
-.ctx-sep { height:1px; background:var(--border); margin:4px 2px; }
+.ctx-sep { height:1px; background:var(--border); margin:var(--sp-1) var(--sp-0); }
 
 /* ============ overlays / modals ============ */
 .overlay {
   position:fixed; inset:0; z-index:50;
   background:rgba(0,0,0,.72); backdrop-filter:blur(2px);
-  display:flex; align-items:center; justify-content:center; padding:20px;
+  display:flex; align-items:center; justify-content:center; padding:var(--sp-5);
 }
 .modal {
   width:100%; max-width:420px;
   background:var(--elev); border:1px solid var(--border-2);
-  border-radius:var(--r); padding:22px; display:flex; flex-direction:column; gap:14px;
+  border-radius:var(--r); padding:var(--sp-6); display:flex; flex-direction:column; gap:var(--section-gap);
 }
 .modal h2 { margin:0; font-size:17px; font-weight:600; }
 .modal p { margin:0; }
 .modal-label { font-size:12.5px; color:var(--muted); line-height:1.4; }
-.modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:4px; }
+.modal-actions { display:flex; gap:var(--sp-3); justify-content:flex-end; margin-top:var(--sp-1); }
 
-.type-cards { display:flex; gap:10px; }
+.type-cards { display:flex; gap:var(--sp-3); }
 .type-card {
   flex:1; cursor:pointer; text-align:left;
   background:var(--panel-2); border:1px solid var(--border-2);
-  border-radius:var(--r-sm); padding:11px 12px;
-  display:flex; flex-direction:column; gap:3px; color:var(--text);
+  border-radius:var(--r-sm); padding:var(--sp-3);
+  display:flex; flex-direction:column; gap:var(--sp-1); color:var(--text);
 }
 .type-card b { font-family:var(--mono); font-size:13px; }
 .type-card:hover { border-color:var(--accent); }
@@ -667,35 +941,35 @@ select.in { appearance:none;
 
 .nm-err, .sm-err {
   color:var(--danger); font-size:12.5px; border:1px solid var(--danger);
-  border-radius:var(--r-sm); padding:7px 10px; background:rgba(255,81,105,.06);
+  border-radius:var(--r-sm); padding:var(--sp-2) var(--sp-3); background:rgba(255,81,105,.06);
 }
 
 .code-box {
-  display:flex; align-items:center; gap:10px; justify-content:space-between;
+  display:flex; align-items:center; gap:var(--sp-3); justify-content:space-between;
   background:var(--panel-2); border:1px solid var(--border-2);
-  border-radius:var(--r-sm); padding:10px 12px;
+  border-radius:var(--r-sm); padding:var(--sp-3);
 }
 .code-box code { font-size:14px; color:var(--green); word-break:break-all; }
 
 /* ============ material picker + empty-slot state ============ */
 .mat-row .btn { flex:0 0 auto; }
 .btn.block { width:100%; justify-content:center; }
-.nomat-hint { display:flex; flex-direction:column; gap:9px; }
+.nomat-hint { display:flex; flex-direction:column; gap:var(--sp-3); }
 .nomat-hint p { margin:0; }
 
 .mp-modal { max-width:640px; }
 .mp-head { display:flex; align-items:center; justify-content:space-between; }
 .mp-head h2 { margin:0; }
-.mp-loading { font-size:13px; padding:8px 2px; }
+.mp-loading { font-size:13px; padding:var(--sp-2) var(--sp-0); }
 .mp-note { font-size:12px; }
 .mp-scroll {
-  max-height:54vh; overflow-y:auto; padding:8px;
+  max-height:54vh; overflow-y:auto; padding:var(--sp-2);
   background:var(--panel); border:1px solid var(--border); border-radius:var(--r-sm);
 }
-.mp-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(82px, 1fr)); gap:6px; }
+.mp-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(82px, 1fr)); gap:var(--sp-2); }
 .mp-cell {
-  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px;
-  min-height:76px; padding:8px 4px; text-align:center; cursor:pointer;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:var(--sp-1);
+  min-height:76px; padding:var(--sp-2) var(--sp-1); text-align:center; cursor:pointer;
   background:var(--panel-2); color:var(--text);
   border:1px solid var(--border); border-radius:var(--r-xs);
 }
@@ -706,12 +980,12 @@ select.in { appearance:none;
 /* ============ toasts ============ */
 .toasts {
   position:fixed; bottom:18px; left:50%; transform:translateX(-50%);
-  z-index:60; display:flex; flex-direction:column; gap:8px; align-items:center;
+  z-index:60; display:flex; flex-direction:column; gap:var(--sp-2); align-items:center;
   pointer-events:none;
 }
 .toast {
   background:var(--elev); border:1px solid var(--border-2);
-  border-radius:var(--r-sm); padding:9px 14px; font-size:13px;
+  border-radius:var(--r-sm); padding:var(--sp-2) var(--sp-4); font-size:13px;
   box-shadow:0 6px 20px rgba(0,0,0,.5); max-width:80vw;
 }
 .toast.err { border-color:var(--danger); color:var(--text); }
@@ -724,11 +998,13 @@ select.in { appearance:none;
 /* ============ responsive (stack under ~900px) ============ */
 @media (max-width:900px) {
   .layout { grid-template-columns:1fr; grid-auto-rows:min-content; }
+  .splitter { display:none; }                 /* no column resizing in the stacked layout */
   .sidebar { border-right:none; border-bottom:1px solid var(--border); max-height:32vh; }
   .props { border-left:none; border-top:1px solid var(--border); }
   .layout.raw-mode .center,
   .layout.graph-mode .center,
   .layout.reqedit-mode .center { grid-column:1; }
-  .topbar { flex-wrap:wrap; height:auto; padding:8px 12px; gap:8px; }
+  .topbar { flex-wrap:wrap; height:auto; padding:var(--sp-2) var(--sp-3); gap:var(--sp-2); }
   .cur-menu { max-width:120px; }
+  .ms-grid { grid-template-columns:1fr; }
 }

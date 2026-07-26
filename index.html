@@ -15,6 +15,16 @@
       3. jsyaml.load each menu's yaml -> plain JS object (edited in the UI)
       4. "Сохранить": jsyaml.dump each object, POST bundle to <w>/post -> { key }
          -> show the new code + "/am apply <code>"
+
+    LAYOUT CHROME (see style.css + the "layout chrome" module at the end of app.js):
+      * .layout is a 5-track grid:  sidebar | .splitter | center | .splitter | props.
+        Widths live in --sidebar-w / --props-w on <html>; the splitters rewrite them and
+        persist to localStorage (am_w_sidebar / am_w_props). Double-click a splitter = reset.
+      * .center-scroll is the single scroll container of the grid view (toolbar + menu-settings
+        + slot grid) — that is what makes «Настройки меню» scrollable with the wheel.
+      * <section class="acc" data-acc="…"> blocks are accordions; open/closed state persists in
+        localStorage (am_acc). They collapse with a 0fr->1fr grid animation, NEVER display:none,
+        so every input inside keeps answering .value even while the section is closed.
   -->
 
   <!-- ===================== TOP BAR ===================== -->
@@ -56,116 +66,187 @@
       </div>
     </aside>
 
+    <!-- drag to resize the menu list; double-click resets to the default width -->
+    <div class="splitter split-left" id="split-left"
+         role="separator" aria-orientation="vertical" tabindex="0"
+         data-splitter="sidebar"
+         title="Потяните, чтобы изменить ширину · двойной клик — сброс"
+         aria-label="Ширина списка меню"></div>
+
     <!-- ---------- CENTER: slot grid / raw yaml ---------- -->
     <section class="center" id="center">
-      <div class="center-toolbar" id="center-toolbar">
-        <label class="field grow">
-          <span class="lbl">Заголовок (title)</span>
-          <!-- NB: the &-hex examples MUST be written as &amp;# — a bare &#55… is parsed as an HTML
-               numeric character reference and the placeholder would show garbage. -->
-          <input type="text" id="menu-title" class="in" placeholder="&6&lМагазин  ·  &amp;#ff5555hex  ·  #55ff55  ·  <gradient:#f00:#00f>тоже" />
-        </label>
-        <label class="field rows-field" id="rows-field">
-          <span class="lbl">Рядов</span>
-          <input type="number" id="menu-rows" class="in" min="1" max="6" step="1" />
-        </label>
-        <div class="sel-count" id="sel-count" hidden></div>
-      </div>
 
-      <!-- Menu-level settings (top-level YAML keys) -->
-      <details class="menu-settings" id="menu-settings">
-        <summary>Настройки меню</summary>
-        <div class="ms-grid">
-          <label class="field">
-            <span class="lbl">Право (permission)</span>
-            <input type="text" id="ms-permission" class="in" placeholder="напр. menus.shop" />
+      <!-- The whole grid view scrolls as one column (toolbar is sticky). -->
+      <div class="center-scroll" id="center-scroll">
+        <div class="center-toolbar" id="center-toolbar">
+          <label class="field grow">
+            <span class="lbl">Заголовок (title)</span>
+            <!-- NB: the &-hex examples MUST be written as &amp;# — a bare &#55… is parsed as an HTML
+                 numeric character reference and the placeholder would show garbage. -->
+            <input type="text" id="menu-title" class="in" placeholder="&6&lМагазин  ·  &amp;#ff5555hex  ·  #55ff55  ·  <gradient:#f00:#00f>тоже" />
           </label>
-          <label class="field">
-            <span class="lbl">Команды (через запятую)</span>
-            <input type="text" id="ms-commands" class="in" placeholder="shop, магазин" />
-          </label>
-          <label class="field ms-wide">
-            <span class="lbl">Описание команды (command-description)</span>
-            <input type="text" id="ms-cmd-desc" class="in" placeholder="Открыть магазин" />
-          </label>
-          <label class="check ms-help">
-            <input type="checkbox" id="ms-show-help" checked />
-            <span>Показывать в /help (show-in-help)</span>
-          </label>
-
-          <label class="field">
-            <span class="lbl">Живое обновление (тиков), 0 = выкл</span>
-            <input type="number" id="ms-update-interval" class="in" min="0" step="1" placeholder="0" />
-          </label>
-          <label class="field">
-            <span class="lbl">Аргументы команды (через запятую)</span>
-            <input type="text" id="ms-args" class="in" placeholder="page, category" />
-          </label>
-
-          <div class="field ms-wide">
-            <span class="lbl">Предмет-открывашка (open-item)</span>
-            <div class="ms-subgrid">
-              <div class="mat-row ms-sub-full">
-                <span class="mat-ic" id="ms-oi-ic" aria-hidden="true"></span>
-                <input type="text" id="ms-oi-material" class="in" placeholder="COMPASS (пусто — выключить)" />
-                <button class="btn small" id="ms-oi-pick" type="button" title="Выбрать материал из списка">Выбрать…</button>
-              </div>
-              <label class="field ms-sub-full">
-                <span class="lbl">Имя (name) — цвета &amp;c, &amp;#RRGGBB, #RRGGBB</span>
-                <input type="text" id="ms-oi-name" class="in" placeholder="&6Меню  (или &amp;#ffaa00, #ffaa00)" />
-              </label>
-              <label class="field">
-                <span class="lbl">custom-model-data (cmd)</span>
-                <input type="text" id="ms-oi-cmd" class="in" placeholder="напр. 101" />
-              </label>
-              <label class="field">
-                <span class="lbl">Слот (-1..8)</span>
-                <input type="number" id="ms-oi-slot" class="in" min="-1" max="8" step="1" placeholder="-1" />
-              </label>
-              <label class="check ms-sub-full">
-                <input type="checkbox" id="ms-oi-join" />
-                <span>Выдавать при входе (give-on-join)</span>
-              </label>
+          <label class="field rows-field" id="rows-field">
+            <span class="lbl">Рядов</span>
+            <div class="num-wrap compact">
+              <input type="number" id="menu-rows" class="in" min="1" max="6" step="1" />
+              <span class="num-steps" aria-hidden="true">
+                <button class="num-step up" type="button" tabindex="-1" title="Больше"></button>
+                <button class="num-step down" type="button" tabindex="-1" title="Меньше"></button>
+              </span>
             </div>
-          </div>
-
-          <div class="field ms-wide">
-            <span class="lbl">Анимация открытия (open-animation)</span>
-            <div class="ms-subgrid">
-              <label class="field">
-                <span class="lbl">Тип</span>
-                <select id="ms-oa-type" class="in">
-                  <option value="none">нет</option>
-                  <option value="sweep">sweep — по слотам</option>
-                  <option value="rows">rows — по рядам</option>
-                  <option value="random">random — вразнобой</option>
-                  <option value="corners">corners — из четырёх углов</option>
-                  <option value="edges">edges — сверху и снизу к центру</option>
-                  <option value="ellipse">ellipse — эллипс из центра к краям</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="lbl">Скорость <b id="ms-oa-speed-val">95</b> <span class="faint">1 — медленно · 100 — быстро</span></span>
-                <input type="range" id="ms-oa-speed" class="in range" min="1" max="100" step="1" value="95" />
-              </label>
-              <label class="field ms-sub-full">
-                <span class="lbl">Звук шага (sound)</span>
-                <input type="text" id="ms-oa-sound" class="in" placeholder="minecraft:ui.button.click" />
-              </label>
-            </div>
-          </div>
-
-          <div class="field ms-wide req-section">
-            <span class="lbl">Требование открытия (open-requirement)</span>
-            <div class="req-block" id="req-open"></div>
-          </div>
+          </label>
+          <div class="sel-count" id="sel-count" hidden></div>
         </div>
-      </details>
 
-      <div class="grid-wrap" id="grid-wrap">
-        <div class="slot-grid" id="slot-grid"></div>
-        <p class="grid-hint" id="grid-hint">Клик по ячейке — выбрать/создать элемент.</p>
-      </div>
+        <!-- Menu-level settings (top-level YAML keys) -->
+        <details class="menu-settings" id="menu-settings">
+          <summary>Настройки меню</summary>
+          <div class="ms-grid">
+            <label class="field">
+              <span class="lbl">Право (permission)</span>
+              <input type="text" id="ms-permission" class="in" placeholder="напр. menus.shop" />
+            </label>
+            <label class="field">
+              <span class="lbl">Команды (через запятую)</span>
+              <input type="text" id="ms-commands" class="in" placeholder="shop, магазин" />
+            </label>
+            <label class="field ms-wide">
+              <span class="lbl">Описание команды (command-description)</span>
+              <input type="text" id="ms-cmd-desc" class="in" placeholder="Открыть магазин" />
+            </label>
+            <label class="check ms-help">
+              <input type="checkbox" id="ms-show-help" checked />
+              <span>Показывать в /help (show-in-help)</span>
+            </label>
+
+            <label class="field">
+              <span class="lbl">Живое обновление (тиков), 0 = выкл</span>
+              <div class="num-wrap">
+                <input type="number" id="ms-update-interval" class="in" min="0" step="1" placeholder="0" />
+                <span class="num-steps" aria-hidden="true">
+                  <button class="num-step up" type="button" tabindex="-1" title="Больше"></button>
+                  <button class="num-step down" type="button" tabindex="-1" title="Меньше"></button>
+                </span>
+              </div>
+            </label>
+            <label class="field">
+              <span class="lbl">Аргументы команды (через запятую)</span>
+              <input type="text" id="ms-args" class="in" placeholder="page, category" />
+            </label>
+
+            <div class="ms-sep" aria-hidden="true"></div>
+
+            <!-- open-item ------------------------------------------------------------- -->
+            <section class="acc ms-wide" data-acc="ms-openitem" data-open="false">
+              <button class="acc-head" type="button" id="acc-ms-openitem-btn"
+                      aria-expanded="false" aria-controls="acc-ms-openitem-body">
+                <span class="acc-chev" aria-hidden="true"></span>
+                <span class="acc-title">Предмет-открывашка (open-item)</span>
+                <span class="acc-sub">материал · имя · слот</span>
+              </button>
+              <div class="acc-body" id="acc-ms-openitem-body" role="region" aria-labelledby="acc-ms-openitem-btn">
+                <div class="acc-inner">
+                  <div class="acc-fields">
+                    <div class="ms-subgrid">
+                      <div class="mat-row ms-sub-full">
+                        <span class="mat-ic" id="ms-oi-ic" aria-hidden="true"></span>
+                        <input type="text" id="ms-oi-material" class="in" placeholder="COMPASS (пусто — выключить)" />
+                        <button class="btn small" id="ms-oi-pick" type="button" title="Выбрать материал из списка">Выбрать…</button>
+                      </div>
+                      <label class="field ms-sub-full">
+                        <span class="lbl">Имя (name) — цвета &amp;c, &amp;#RRGGBB, #RRGGBB</span>
+                        <input type="text" id="ms-oi-name" class="in" placeholder="&6Меню  (или &amp;#ffaa00, #ffaa00)" />
+                      </label>
+                      <label class="field">
+                        <span class="lbl">custom-model-data (cmd)</span>
+                        <input type="text" id="ms-oi-cmd" class="in" placeholder="напр. 101" />
+                      </label>
+                      <label class="field">
+                        <span class="lbl">Слот (-1..8)</span>
+                        <div class="num-wrap">
+                          <input type="number" id="ms-oi-slot" class="in" min="-1" max="8" step="1" placeholder="-1" />
+                          <span class="num-steps" aria-hidden="true">
+                            <button class="num-step up" type="button" tabindex="-1" title="Больше"></button>
+                            <button class="num-step down" type="button" tabindex="-1" title="Меньше"></button>
+                          </span>
+                        </div>
+                      </label>
+                      <label class="check ms-sub-full">
+                        <input type="checkbox" id="ms-oi-join" />
+                        <span>Выдавать при входе (give-on-join)</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- open-animation -------------------------------------------------------- -->
+            <section class="acc ms-wide" data-acc="ms-anim" data-open="false">
+              <button class="acc-head" type="button" id="acc-ms-anim-btn"
+                      aria-expanded="false" aria-controls="acc-ms-anim-body">
+                <span class="acc-chev" aria-hidden="true"></span>
+                <span class="acc-title">Анимация открытия (open-animation)</span>
+                <span class="acc-sub">тип · скорость · звук</span>
+              </button>
+              <div class="acc-body" id="acc-ms-anim-body" role="region" aria-labelledby="acc-ms-anim-btn">
+                <div class="acc-inner">
+                  <div class="acc-fields">
+                    <div class="ms-subgrid">
+                      <label class="field">
+                        <span class="lbl">Тип</span>
+                        <select id="ms-oa-type" class="in">
+                          <option value="none">нет</option>
+                          <option value="sweep">sweep — по слотам</option>
+                          <option value="rows">rows — по рядам</option>
+                          <option value="random">random — вразнобой</option>
+                          <option value="corners">corners — из четырёх углов</option>
+                          <option value="edges">edges — сверху и снизу к центру</option>
+                          <option value="ellipse">ellipse — эллипс из центра к краям</option>
+                        </select>
+                      </label>
+                      <!-- Pace in percent. 1..100 = one reveal step every N ticks (100 = every tick,
+                           the engine's floor). 101..200 = more than one step per tick, i.e. a batch
+                           per tick — see OA_SPEED_MAX / oaBatchOf() in app.js. -->
+                      <label class="field">
+                        <span class="lbl">Скорость <b id="ms-oa-speed-val">95%</b> <span class="faint">1% — медленно · 100% — обычная · 200% — вдвое быстрее</span></span>
+                        <input type="range" id="ms-oa-speed" class="in range" min="1" max="200" step="1" value="95" />
+                        <span class="range-scale" aria-hidden="true"><span>1</span><span>100</span><span>200</span></span>
+                        <span class="faint" id="ms-oa-speed-note" hidden></span>
+                      </label>
+                      <label class="field ms-sub-full">
+                        <span class="lbl">Звук шага (sound)</span>
+                        <input type="text" id="ms-oa-sound" class="in" placeholder="minecraft:ui.button.click" />
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- open-requirement ------------------------------------------------------ -->
+            <section class="acc ms-wide req-section" data-acc="ms-openreq" data-open="false">
+              <button class="acc-head" type="button" id="acc-ms-openreq-btn"
+                      aria-expanded="false" aria-controls="acc-ms-openreq-body">
+                <span class="acc-chev" aria-hidden="true"></span>
+                <span class="acc-title">Требование открытия (open-requirement)</span>
+              </button>
+              <div class="acc-body" id="acc-ms-openreq-body" role="region" aria-labelledby="acc-ms-openreq-btn">
+                <div class="acc-inner">
+                  <div class="acc-fields">
+                    <div class="req-block" id="req-open"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </details>
+
+        <div class="grid-wrap" id="grid-wrap">
+          <div class="slot-grid" id="slot-grid"></div>
+          <p class="grid-hint" id="grid-hint">Клик по ячейке — выбрать/создать элемент.</p>
+        </div>
+      </div><!-- /.center-scroll -->
 
       <!-- Raw YAML escape hatch (triggers, open-requirement, conditional, dialog, ...) -->
       <div class="raw-wrap" id="raw-wrap" hidden>
@@ -192,6 +273,13 @@
       <div class="reqedit-wrap" id="reqedit-wrap" hidden></div>
     </section>
 
+    <!-- drag to resize the item editor; double-click resets to the default width -->
+    <div class="splitter split-right" id="split-right"
+         role="separator" aria-orientation="vertical" tabindex="0"
+         data-splitter="props"
+         title="Потяните, чтобы изменить ширину · двойной клик — сброс"
+         aria-label="Ширина панели настроек предмета"></div>
+
     <!-- ---------- RIGHT PANEL: slot editor ---------- -->
     <aside class="props" id="props">
       <div class="props-empty" id="slot-empty">
@@ -206,7 +294,9 @@
           <button class="btn small danger-ghost" id="clear-slot-btn" type="button">Очистить слот</button>
         </div>
 
-        <label class="field">
+        <!-- ALWAYS OPEN: the material decides whether anything below exists at all, so it is
+             deliberately NOT an accordion. -->
+        <label class="field props-key">
           <span class="lbl">Материал (material)</span>
           <div class="mat-row">
             <span class="mat-ic" id="mat-ic" aria-hidden="true"></span>
@@ -228,71 +318,153 @@
         <!-- Slot mode: a normal item/button, or an INPUT slot the player can put their own items into.
              The mode is stored as the presence of the element's `input:` map; the editor below is
              built by renderInputEditor() and always writes to the ACTIVE slot only (never bulk). -->
-        <div class="field slot-mode" id="f-mode-field">
-          <span class="lbl">Режим слота</span>
-          <div class="mat-row" id="f-mode-tabs">
-            <button type="button" class="btn small primary" id="f-mode-item" aria-pressed="true">Обычный предмет</button>
-            <button type="button" class="btn small" id="f-mode-input" aria-pressed="false">Слот для предметов игрока</button>
+        <section class="acc" data-acc="mode" data-open="false">
+          <button class="acc-head" type="button" id="acc-mode-btn"
+                  aria-expanded="false" aria-controls="acc-mode-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Режим слота</span>
+          </button>
+          <div class="acc-body" id="acc-mode-body" role="region" aria-labelledby="acc-mode-btn">
+            <div class="acc-inner">
+              <div class="acc-fields">
+                <div class="field slot-mode" id="f-mode-field">
+                  <div class="mat-row" id="f-mode-tabs">
+                    <button type="button" class="btn small primary" id="f-mode-item" aria-pressed="true">Обычный предмет</button>
+                    <button type="button" class="btn small" id="f-mode-input" aria-pressed="false">Слот для предметов игрока</button>
+                  </div>
+                  <p class="faint" id="f-mode-hint">Обычный предмет: клики выполняют действия из списка ниже.</p>
+                </div>
+              </div>
+            </div>
           </div>
-          <p class="faint" id="f-mode-hint">Обычный предмет: клики выполняют действия из списка ниже.</p>
-        </div>
+        </section>
 
-        <!-- Input-slot editor (accept-фильтры, max-amount, lock-extract, placeholder, on-* действия) -->
-        <div class="field input-wrap" id="f-input-wrap" hidden></div>
-
-        <!-- Custom player-head skin — shown only when the material is a player head. Fill one field. -->
-        <div class="field head-fields" id="f-head-fields" hidden>
-          <span class="lbl">Голова игрока (кастомный скин)</span>
-          <input type="text" id="f-head-owner" class="in" placeholder="Ник владельца (head-owner) — %player_name% тоже" />
-          <input type="text" id="f-head-uuid" class="in" placeholder="UUID (head-uuid)" />
-          <textarea id="f-head-texture" class="in area" rows="2" placeholder="Текстура (head-texture): base64 / URL скина / hash"></textarea>
-          <p class="faint">Заполни одно поле. <b>Текстура</b> — самый надёжный путь (оффлайн, точный скин). Ник/UUID берут скин онлайн-игрока или из кэша сервера.</p>
-        </div>
-
-        <label class="field">
-          <span class="lbl">custom-model-data (cmd)</span>
-          <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
-        </label>
-
-        <label class="field">
-          <span class="lbl">Имя (name) — цвета &amp;c, &amp;#RRGGBB, #RRGGBB</span>
-          <input type="text" id="f-name" class="in" placeholder="&aКнопка  (или &amp;#55ff55, #55ff55)" />
-        </label>
-
-        <label class="field">
-          <span class="lbl">Лор (lore, по строке на ряд)</span>
-          <textarea id="f-lore" class="in area" rows="3" placeholder="&7Первая строка&#10;&amp;#ffaa00Вторая строка&#10;#55ff55Третья"></textarea>
-        </label>
-
-        <div class="field">
-          <span class="lbl">Флаги (скрытие тултипов)</span>
-          <div class="flags" id="f-flags"></div>
-          <label class="check hideall">
-            <input type="checkbox" id="f-hideall" />
-            <span>Скрыть всё (hide-all)</span>
-          </label>
-        </div>
-
-        <div class="field">
-          <div class="clicks-head">
-            <span class="lbl">Действия по кликам (clicks)</span>
+        <!-- Input-slot editor (accept-фильтры, max-amount, lock-extract, placeholder, on-* действия).
+             renderSlotMode() toggles [hidden] on #f-input-wrap; data-autohide folds the whole
+             accordion away in that case (CSS :has rule) so no empty header is left. -->
+        <section class="acc" data-acc="input" data-open="true" data-autohide>
+          <button class="acc-head" type="button" id="acc-input-btn"
+                  aria-expanded="true" aria-controls="acc-input-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Слот для предметов игрока (input)</span>
+          </button>
+          <div class="acc-body" id="acc-input-body" role="region" aria-labelledby="acc-input-btn">
+            <div class="acc-inner">
+              <div class="field input-wrap" id="f-input-wrap" hidden></div>
+            </div>
           </div>
-          <div class="clicks" id="f-clicks"></div>
-        </div>
+        </section>
+
+        <!-- Custom player-head skin — shown only when the material is a player head. Fill one field.
+             renderHeadFields() toggles [hidden] on #f-head-fields -> data-autohide, same as above. -->
+        <section class="acc" data-acc="head" data-open="true" data-autohide>
+          <button class="acc-head" type="button" id="acc-head-btn"
+                  aria-expanded="true" aria-controls="acc-head-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Голова игрока (кастомный скин)</span>
+          </button>
+          <div class="acc-body" id="acc-head-body" role="region" aria-labelledby="acc-head-btn">
+            <div class="acc-inner">
+              <div class="field head-fields" id="f-head-fields" hidden>
+                <input type="text" id="f-head-owner" class="in" placeholder="Ник владельца (head-owner) — %player_name% тоже" />
+                <input type="text" id="f-head-uuid" class="in" placeholder="UUID (head-uuid)" />
+                <textarea id="f-head-texture" class="in area" rows="2" placeholder="Текстура (head-texture): base64 / URL скина / hash"></textarea>
+                <p class="faint">Заполни одно поле. <b>Текстура</b> — самый надёжный путь (оффлайн, точный скин). Ник/UUID берут скин онлайн-игрока или из кэша сервера.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Внешний вид: cmd + имя + лор (open by default — the everyday fields) -->
+        <section class="acc" data-acc="look" data-open="true">
+          <button class="acc-head" type="button" id="acc-look-btn"
+                  aria-expanded="true" aria-controls="acc-look-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Внешний вид</span>
+            <span class="acc-sub">имя · лор · модель</span>
+          </button>
+          <div class="acc-body" id="acc-look-body" role="region" aria-labelledby="acc-look-btn">
+            <div class="acc-inner">
+              <div class="acc-fields">
+                <label class="field">
+                  <span class="lbl">Имя (name) — цвета &amp;c, &amp;#RRGGBB, #RRGGBB</span>
+                  <input type="text" id="f-name" class="in" placeholder="&aКнопка  (или &amp;#55ff55, #55ff55)" />
+                </label>
+
+                <label class="field">
+                  <span class="lbl">Лор (lore, по строке на ряд)</span>
+                  <textarea id="f-lore" class="in area" rows="3" placeholder="&7Первая строка&#10;&amp;#ffaa00Вторая строка&#10;#55ff55Третья"></textarea>
+                </label>
+
+                <label class="field">
+                  <span class="lbl">custom-model-data (cmd)</span>
+                  <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
+                </label>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Флаги: «Скрыть всё (hide-all)» стоит ПЕРВЫМ, сразу под заголовком секции -->
+        <section class="acc" data-acc="flags" data-open="false">
+          <button class="acc-head" type="button" id="acc-flags-btn"
+                  aria-expanded="false" aria-controls="acc-flags-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Флаги (скрытие тултипов)</span>
+          </button>
+          <div class="acc-body" id="acc-flags-body" role="region" aria-labelledby="acc-flags-btn">
+            <div class="acc-inner">
+              <div class="acc-fields">
+                <label class="check hideall">
+                  <input type="checkbox" id="f-hideall" />
+                  <span>Скрыть всё (hide-all)</span>
+                </label>
+                <div class="flags" id="f-flags"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Действия по кликам (open by default — the main reason a slot exists) -->
+        <section class="acc" data-acc="clicks" data-open="true">
+          <button class="acc-head" type="button" id="acc-clicks-btn"
+                  aria-expanded="true" aria-controls="acc-clicks-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Действия по кликам (clicks)</span>
+          </button>
+          <div class="acc-body" id="acc-clicks-body" role="region" aria-labelledby="acc-clicks-btn">
+            <div class="acc-inner">
+              <div class="acc-fields">
+                <div class="clicks" id="f-clicks"></div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- Requirements: view (bare requirement) + click (block with deny/success actions) -->
-        <div class="field req-section">
-          <span class="lbl">Требования</span>
-          <div class="req-group">
-            <span class="req-group-lbl">Показ (view-requirement)</span>
-            <p class="faint" id="req-view-input-note" hidden>На input-слоте условие показа игнорируется плагином — скрытый слот терял бы вещи игрока.</p>
-            <div id="req-view"></div>
+        <section class="acc" data-acc="req" data-open="false">
+          <button class="acc-head" type="button" id="acc-req-btn"
+                  aria-expanded="false" aria-controls="acc-req-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Требования</span>
+            <span class="acc-sub">показ · клик</span>
+          </button>
+          <div class="acc-body" id="acc-req-body" role="region" aria-labelledby="acc-req-btn">
+            <div class="acc-inner">
+              <div class="acc-fields req-section">
+                <div class="req-group">
+                  <span class="req-group-lbl">Показ (view-requirement)</span>
+                  <p class="faint" id="req-view-input-note" hidden>На input-слоте условие показа игнорируется плагином — скрытый слот терял бы вещи игрока.</p>
+                  <div id="req-view"></div>
+                </div>
+                <div class="req-group">
+                  <span class="req-group-lbl">Клик (click-requirement)</span>
+                  <div class="req-block" id="req-click"></div>
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="req-group">
-            <span class="req-group-lbl">Клик (click-requirement)</span>
-            <div class="req-block" id="req-click"></div>
-          </div>
-        </div>
+        </section>
         </div><!-- /#slot-rest -->
       </div>
     </aside>

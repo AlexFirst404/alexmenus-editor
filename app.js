@@ -72,6 +72,22 @@
     ['drop', 'Выброс (Q)'], ['any', 'Любой клик']
   ];
 
+  // open-animation pace scale, in percent.
+  //   1..100  -> one reveal step every N ticks; 100 = one step per tick (the engine's hard floor,
+  //              OpenAnimation.ticksFromSpeed() maps 1..100 onto 20..1 ticks).
+  //   101..200-> more than one step per tick — the interval is already 1, so the extra speed has to
+  //              come from revealing a BATCH per tick (see oaBatchOf). Engine builds that predate the
+  //              batch support clamp such a value back to 100, which only costs speed, never breaks.
+  const OA_SPEED_MAX = 200;
+  // Steps revealed per tick for a given speed: 1 up to 100%, then +1 per started 25 points —
+  // 101..125 -> 2, 126..150 -> 3, 151..175 -> 4, 176..200 -> 5. `ceil` (not `round`) on purpose:
+  // every value above 100 must be strictly faster than 100, otherwise 101..112 would silently
+  // behave exactly like 100. This is the contract the Java side has to mirror.
+  function oaBatchOf(speed) {
+    const s = Math.max(1, Math.min(OA_SPEED_MAX, parseInt(speed, 10) || 0));
+    return s <= 100 ? 1 : 1 + Math.ceil((s - 100) / 25);
+  }
+
   // common item-flags exposed as checkboxes (hide-all handled separately)
   const HIDE_FLAGS = [
     'HIDE_ATTRIBUTES', 'HIDE_ENCHANTS', 'HIDE_UNBREAKABLE', 'HIDE_ADDITIONAL_TOOLTIP',
@@ -142,6 +158,41 @@
     return n;
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  // ru plural: plural(1,'шаг','шага','шагов') -> 'шаг', 2 -> 'шага', 5 -> 'шагов'
+  function plural(n, one, few, many) {
+    const a = Math.abs(n) % 100, b = a % 10;
+    if (a > 10 && a < 20) return many;
+    if (b === 1) return one;
+    if (b >= 2 && b <= 4) return few;
+    return many;
+  }
+
+  // ---- bridges into the LAYOUT CHROME module (bottom of this file) --------------------------
+  // The chrome module owns the number steppers and the accordions. Both bridges are no-ops until it
+  // has booted (it registers window.AlexMenusChrome while parsing, so in practice it is always there),
+  // which keeps the render functions independent of load order.
+
+  // Decorate freshly built <input type="number"> under `root` with the themed up/down arrows and
+  // refresh their at-limit greying. Idempotent — safe (and expected) after every re-render. A
+  // MutationObserver in the chrome module is the safety net for nodes built outside these calls;
+  // calling it directly just makes the arrows appear in the same frame instead of the next one.
+  function numChrome(root) {
+    const c = window.AlexMenusChrome;
+    if (c && typeof c.enhanceNumbers === 'function') c.enhanceNumbers(root || document);
+  }
+  // Put a short summary next to an accordion title (visible while the section is COLLAPSED), so a
+  // closed «Действия по кликам» still says how many actions hide in there. Creates the <span> when
+  // the markup has none. Passing an empty string clears it.
+  function setAccSub(key, text) {
+    const acc = document.querySelector('.acc[data-acc="' + key + '"]');
+    if (!acc) return;
+    const head = acc.querySelector('.acc-head');
+    if (!head) return;
+    let sub = head.querySelector('.acc-sub');
+    if (!sub) { sub = el('span', 'acc-sub'); head.append(sub); }
+    sub.textContent = text || '';
+  }
+
   const current = () => (state.sel >= 0 ? state.menus[state.sel] : null);
   // Clearing the selection also leaves the full-screen requirement editor: its onChange closures are
   // bound to the previous menu/slot context, so switching menu (which resetSelection()s) must exit it.
@@ -371,6 +422,9 @@
     } else {
       rowsField.hidden = true;
     }
+    // `inp.value` was set programmatically above (no `input` event), so ask the chrome module to
+    // re-evaluate which of the ▲/▼ arrows must be greyed out at the 1/6 limits.
+    numChrome($('center-toolbar'));
     renderGrid();
   }
 
@@ -448,27 +502,48 @@
 
     // open-animation {type, interval, sound} — omitted when type is none/empty
     const oa = (m.obj['open-animation'] && typeof m.obj['open-animation'] === 'object') ? m.obj['open-animation'] : {};
-    const oaType = $('ms-oa-type'), oaSpeed = $('ms-oa-speed'), oaSpeedVal = $('ms-oa-speed-val'), oaSound = $('ms-oa-sound');
+    const oaType = $('ms-oa-type'), oaSpeed = $('ms-oa-speed'), oaSpeedVal = $('ms-oa-speed-val'),
+          oaSound = $('ms-oa-sound'), oaNote = $('ms-oa-speed-note');
+    oaSpeed.max = String(OA_SPEED_MAX);   // safety net if index.html is older than this script
     oaType.value = normalizeOaType(oa.type);
     oaSpeed.value = String(oaSpeedOf(oa));
-    oaSpeedVal.textContent = oaSpeed.value;
     oaSound.value = oa.sound != null ? String(oa.sound) : '';
-    // A legacy `interval` outside the representable 1..20 tick range has no exact 1..100 speed; keep it
+    // A legacy `interval` outside the representable 1..20 tick range has no exact speed value; keep it
     // verbatim until the admin actually moves the slider, instead of silently speeding the menu up.
     const legacyIv = (oa && oa.speed == null && oa.interval != null) ? parseInt(oa.interval, 10) : NaN;
     const legacyUnrepresentable = !isNaN(legacyIv) && (legacyIv < 1 || legacyIv > 20);
     const legacySliderValue = oaSpeedOf(oa);
+    // 1..100 = one reveal step every N ticks (100 = every tick). Above 100 the pace can no longer be
+    // expressed as a tick interval — it means "more than one step per tick" (a BATCH). The engine
+    // implements exactly the oaBatchOf() split (OpenAnimation.batchFromSpeed); plugin builds older than
+    // that clamp 101..200 back to 100, which only costs speed and never breaks. Say so either way.
+    const paintSpeed = () => {
+      const sp = parseInt(oaSpeed.value, 10);
+      oaSpeedVal.textContent = (isNaN(sp) ? '—' : sp) + '%';
+      if (!oaNote) return;
+      const fast = !isNaN(sp) && sp > 100;
+      oaNote.hidden = !fast;
+      const batch = oaBatchOf(sp);
+      oaNote.textContent = fast
+        ? 'Выше 100% меню раскрывается пачками: ' + batch + ' ' + plural(batch, 'шаг', 'шага', 'шагов')
+          + ' за тик. Нужен плагин с поддержкой пачек — более старые сборки зажмут значение до 100%.'
+        : '';
+      setAccSub('ms-anim', (oaType.value === 'none' || !oaType.value)
+        ? 'выключена'
+        : oaType.value + ' · ' + (isNaN(sp) ? '—' : sp) + '%');
+    };
     const syncOpenAnim = () => {
-      oaSpeedVal.textContent = oaSpeed.value;
+      paintSpeed();
       const t = oaType.value;
       if (!t || t === 'none') { delete m.obj['open-animation']; return; }
       const spec = { type: t };
       const sp = parseInt(oaSpeed.value, 10);
       if (legacyUnrepresentable && sp === legacySliderValue) spec.interval = legacyIv;
-      else if (!isNaN(sp)) spec.speed = Math.max(1, Math.min(100, sp));   // 1..100 (legacy is migrated)
+      else if (!isNaN(sp)) spec.speed = Math.max(1, Math.min(OA_SPEED_MAX, sp));   // 1..200
       const snd = oaSound.value.trim(); if (snd) spec.sound = snd;
       m.obj['open-animation'] = spec;
     };
+    paintSpeed();
     oaType.onchange = syncOpenAnim;
     oaSpeed.oninput = syncOpenAnim;
     oaSound.oninput = syncOpenAnim;
@@ -478,6 +553,11 @@
       () => (m.obj['open-requirement'] != null ? m.obj['open-requirement'] : null),
       (block) => { if (block == null) delete m.obj['open-requirement']; else m.obj['open-requirement'] = block; },
       { title: 'Условие открытия меню (open-requirement)', scope: 'menu' });
+
+    // collapsed-state summaries + steppers for everything this pass (re)built
+    setAccSub('ms-openitem', oiMat.value.trim() ? oiMat.value.trim().toUpperCase() : 'не задан');
+    setAccSub('ms-openreq', m.obj['open-requirement'] != null ? 'задано' : 'нет');
+    numChrome(box);
   }
 
   // chest = rows*9 cells; inventory = 27; other types -> note (edit via raw YAML)
@@ -525,17 +605,12 @@
 
   // an element is an INPUT slot as soon as it carries an `input:` map (the plugin's own marker)
   function isInputItem(it) { return !!(it && typeof it === 'object' && it.input && typeof it.input === 'object'); }
-  // visual marker for an input slot: dashed border + a small ⇩ badge. Styled inline on purpose —
-  // style.css is not part of this change — and deliberately NOT via box-shadow, which would fight
-  // the .selected/.active rings.
+  // visual marker for an input slot: dashed border + a small ⇩ badge. Look lives in style.css
+  // (.cell.input-slot / .cell-input-badge) so it follows the theme and the spacing scale.
   function markInputCell(cell) {
     cell.classList.add('input-slot');
     cell.title = 'Input-слот: игрок кладёт сюда свои вещи';
-    cell.style.borderStyle = 'dashed';
-    const badge = el('span', 'cell-input-badge', '⇩');
-    badge.style.cssText = 'position:absolute;right:3px;bottom:2px;font-size:11px;line-height:1;'
-      + 'color:var(--accent);font-family:var(--mono);pointer-events:none;';
-    cell.append(badge);
+    cell.append(el('span', 'cell-input-badge', '⇩'));
   }
 
   // ---------- selection interactions ----------
@@ -676,6 +751,31 @@
     renderFlags(disp);
     renderClicks(disp);
     renderSlotRequirements(disp);   // view-requirement + click-requirement builders (bulk-aware)
+    setAccSub('look', lookSummary(disp));
+    // Everything above rebuilt its inputs from scratch — hand the fresh <input type=number> nodes to
+    // the stepper decorator. It is idempotent, and the accordions are static markup that renderProps
+    // never recreates, so their listeners (one delegated click on document) are NOT re-bound here.
+    numChrome(body);
+  }
+
+  // drop the colour syntax the plugin understands, so a collapsed summary reads as plain text
+  function stripColors(s) {
+    return String(s)
+      .replace(/<[^>]*>/g, '')                 // <gradient:#f00:#00f>, <red>, …
+      .replace(/&#[0-9a-fA-F]{6}/g, '')        // &#RRGGBB
+      .replace(/#[0-9a-fA-F]{6}/g, '')         // bare #RRGGBB
+      .replace(/[&§][0-9a-fk-orA-FK-OR]/g, '')
+      .trim();
+  }
+  // one-line «what does this item look like» summary for the collapsed «Внешний вид» accordion
+  function lookSummary(disp) {
+    const bits = [];
+    const nm = stripColors(disp.name != null ? disp.name : '');
+    if (nm) bits.push(nm.length > 26 ? nm.slice(0, 25) + '…' : nm);
+    const loreLines = Array.isArray(disp.lore) ? disp.lore.length : (disp.lore ? 1 : 0);
+    if (loreLines) bits.push(loreLines + ' стр. лора');
+    if (disp.cmd != null && String(disp.cmd).trim() !== '') bits.push('cmd ' + disp.cmd);
+    return bits.length ? bits.join(' · ') : 'имя · лор · модель';
   }
 
   // ================================================================== INPUT SLOTS (element key `input:`)
@@ -705,9 +805,11 @@
     const note = $('req-view-input-note');
     if (note) note.hidden = !isInput;
 
+    setAccSub('mode', isInput ? 'слот для предметов игрока' : 'обычный предмет');
+
     const wrap = $('f-input-wrap');
     if (!wrap) return;
-    wrap.hidden = !isInput;
+    wrap.hidden = !isInput;   // [hidden] here also folds the whole «input» accordion away (data-autohide)
     if (isInput) renderInputEditor(wrap, it);
     else clear(wrap);
   }
@@ -729,11 +831,8 @@
     const inp = it.input;
 
     // parser rules the plugin enforces — surfaced here so nothing dies silently in the server log
-    const warn = el('div', 'input-warn');
-    warn.style.cssText = 'display:flex;flex-direction:column;gap:4px;font-size:12px;line-height:1.35;'
-      + 'color:var(--muted);border:1px solid var(--border);border-left:2px solid var(--accent);'
-      + 'border-radius:6px;padding:7px 9px;';
-    const lines = ['Действия on-insert / on-extract / on-reject срабатывают на вложение, изъятие и отказ фильтра.'];
+    const warn = el('div', 'input-warn');   // look: .input-warn in style.css
+    const lines =['Действия on-insert / on-extract / on-reject срабатывают на вложение, изъятие и отказ фильтра.'];
     if (m && (m.obj.type || 'chest') === 'inventory') {
       lines.push('⚠ Тип меню «inventory» не поддерживает input-слоты — плагин выбросит этот элемент.');
     }
@@ -870,30 +969,55 @@
     return row;
   }
 
+  // «Скрыть всё (hide-all)» is deliberately the FIRST control of the section (see index.html): it is the
+  // switch people actually reach for, and it overrides the eight individual flags below it. The two are
+  // independent YAML keys — hide-all does NOT rewrite `flags:` — so ticking it only DIMS the list (the
+  // per-flag values stay editable and are preserved for when hide-all goes back off).
   function renderFlags(disp) {
     const wrap = $('f-flags');
+    const hideAll = $('f-hideall');
     clear(wrap);
     const flags = Array.isArray(disp.flags) ? disp.flags : [];
+    const boxes = [];
+
+    const syncFlagsUi = () => {
+      const all = !!(hideAll && hideAll.checked);
+      const on = boxes.filter((c) => c.checked).length;
+      wrap.classList.toggle('is-dimmed', all);
+      wrap.title = all ? 'Скрыто всё — отдельные флаги сейчас ни на что не влияют' : '';
+      setAccSub('flags', all
+        ? (on ? 'скрыто всё (+' + on + ' в запасе)' : 'скрыто всё')
+        : (on ? on + ' из ' + HIDE_FLAGS.length : 'нет'));
+    };
+
     HIDE_FLAGS.forEach((flag) => {
       const lab = el('label', 'check');
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.checked = flags.indexOf(flag) !== -1;
-      cb.onchange = () => applyBulk((it) => {
-        let arr = Array.isArray(it.flags) ? it.flags.slice() : [];
-        if (cb.checked) { if (arr.indexOf(flag) === -1) arr.push(flag); }
-        else { arr = arr.filter((f) => f !== flag); }
-        if (arr.length) it.flags = arr; else delete it.flags;
-      }, false);
+      cb.onchange = () => {
+        applyBulk((it) => {
+          let arr = Array.isArray(it.flags) ? it.flags.slice() : [];
+          if (cb.checked) { if (arr.indexOf(flag) === -1) arr.push(flag); }
+          else { arr = arr.filter((f) => f !== flag); }
+          if (arr.length) it.flags = arr; else delete it.flags;
+        }, false);
+        syncFlagsUi();
+      };
       lab.append(cb, el('span', null, flag.replace('HIDE_', '')));
+      boxes.push(cb);
       wrap.append(lab);
     });
 
-    const hideAll = $('f-hideall');
+    if (!hideAll) return;
     hideAll.checked = disp['hide-all'] === true;
-    hideAll.onchange = () => applyBulk((it) => {
-      if (hideAll.checked) it['hide-all'] = true; else delete it['hide-all'];
-    }, false);
+    hideAll.onchange = () => {
+      applyBulk((it) => {
+        if (hideAll.checked) it['hide-all'] = true; else delete it['hide-all'];
+      }, false);
+      syncFlagsUi();
+    };
+    syncFlagsUi();
   }
 
   // ---------- clicks editor (per click-kind: list of action rows) ----------
@@ -903,9 +1027,11 @@
     const wrap = $('f-clicks');
     clear(wrap);
     const clicks = (disp && disp.clicks && typeof disp.clicks === 'object') ? disp.clicks : {};
+    let total = 0, kinds = 0;
 
     CLICK_KINDS.forEach(([kind, label]) => {
       const actions = Array.isArray(clicks[kind]) ? clicks[kind] : null;
+      if (actions) { kinds++; total += actions.length; }
       const block = el('div', 'click-kind');
 
       const head = el('div', 'ck-head');
@@ -931,6 +1057,8 @@
       block.append(bodyEl);
       wrap.append(block);
     });
+
+    setAccSub('clicks', total ? (total + ' действ. в ' + kinds + ' вид. кликов') : 'нет действий');
   }
 
   function buildActionRow(kind, idx) {
@@ -1319,14 +1447,15 @@
     if (s === 'ellipse' || s === 'oval' || s === 'ripple' || s === 'center') return 'ellipse';
     return 'none';
   }
-  // stored open-animation pace -> a 1..100 slider value (legacy `interval` ticks are converted)
+  // stored open-animation pace -> a 1..OA_SPEED_MAX slider value (legacy `interval` ticks are converted)
   function oaSpeedOf(oa) {
     if (oa && oa.speed != null) {
       const s = parseInt(oa.speed, 10);
-      if (!isNaN(s)) return Math.max(1, Math.min(100, s));
+      if (!isNaN(s)) return Math.max(1, Math.min(OA_SPEED_MAX, s));   // >100 (batched) survives a round-trip
     }
     if (oa && oa.interval != null) {
       const iv = parseInt(oa.interval, 10);
+      // a legacy tick interval can only ever describe 1..100 — never invent a batched speed from it
       if (!isNaN(iv)) return Math.max(1, Math.min(100, 100 - (iv - 1) * 5));
     }
     return 95;   // ≈2 ticks/step — matches the pre-speed default instead of the much slower slider midpoint
@@ -2181,6 +2310,11 @@
       () => (disp && disp['click-requirement']) || null,
       (block) => writeReqKey('click-requirement', block),
       { title: 'Условие клика (click-requirement)', scope: 'slot' });
+
+    const set = [];
+    if (disp && disp['view-requirement'] != null) set.push('показ');
+    if (disp && disp['click-requirement'] != null) set.push('клик');
+    setAccSub('req', set.length ? set.join(' · ') : 'не заданы');
   }
 
   // ================================================================== FULL-SCREEN REQUIREMENT EDITOR
@@ -2282,6 +2416,7 @@
       else if (local.mode === 'simple') buildRequirementBuilder(body, currentValue, change);
       else buildReqRawFull(body, currentValue, change);
       Object.keys(tabBtns).forEach((k) => tabBtns[k].classList.toggle('active', k === local.mode));
+      numChrome(body);   // «Сумма» / «Кол-во» number fields of the structured tab get the ▲/▼ arrows too
     }
     tabDefs.forEach(([k, label]) => {
       const b = el('button', 'btn small reqedit-tab', label); b.type = 'button';
@@ -3788,4 +3923,413 @@
   // go
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
+})();
+
+/* ====================================================================================
+ * AlexMenus web editor — LAYOUT CHROME MODULE  (splitters · accordions · number steppers)
+ *
+ * A completely self-contained IIFE appended after the main app. It NEVER touches the
+ * editor's state, render functions or field handlers — it only:
+ *   1. resizes the two side columns by writing --sidebar-w / --props-w on <html>,
+ *   2. opens/closes <section class="acc"> blocks (grid 0fr->1fr, never display:none),
+ *   3. decorates <input type="number"> with the themed up/down stepper markup.
+ *
+ * localStorage keys used here (all optional, all fail-soft in private mode):
+ *   am_w_sidebar  - left column width in px
+ *   am_w_props    - right column width in px
+ *   am_acc        - JSON map { "<data-acc>": true|false } of accordion open state
+ * ==================================================================================== */
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- tiny storage helpers
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode / quota */ } }
+  function lsDel(k) { try { localStorage.removeItem(k); } catch (e) { /* private mode */ } }
+
+  // ================================================================== 1. COLUMN SPLITTERS
+  // The grid is  sidebar | splitter | center | splitter | props  (see .layout in style.css).
+  // Only the two custom properties below are ever written - nothing else knows about widths.
+  const COLS = {
+    sidebar: { varName: '--sidebar-w', key: 'am_w_sidebar', def: 240, min: 180, max: 520 },
+    props:   { varName: '--props-w',   key: 'am_w_props',   def: 340, min: 280, max: 680 }
+  };
+  const CENTER_MIN = 300;   // the center column never collapses below this
+  const SPLIT_W = 7;        // keep in sync with --split-w
+
+  function currentWidth(name) {
+    const c = COLS[name];
+    const raw = getComputedStyle(document.documentElement).getPropertyValue(c.varName);
+    const n = parseFloat(raw);
+    return isFinite(n) ? n : c.def;
+  }
+
+  function clampWidth(name, px) {
+    const c = COLS[name];
+    let v = Math.round(Number(px));
+    if (!isFinite(v)) v = c.def;
+    v = Math.max(c.min, Math.min(c.max, v));
+    // also guarantee the center keeps CENTER_MIN - the OTHER column's current width is fixed
+    const layout = document.getElementById('layout');
+    const total = layout ? layout.getBoundingClientRect().width : 0;
+    if (total > 0) {
+      const other = name === 'sidebar' ? 'props' : 'sidebar';
+      const room = total - currentWidth(other) - SPLIT_W * 2 - CENTER_MIN;
+      if (room > c.min) v = Math.min(v, Math.round(room));
+    }
+    return v;
+  }
+
+  function setWidth(name, px, persist) {
+    const c = COLS[name];
+    if (!c) return null;
+    const v = clampWidth(name, px);
+    document.documentElement.style.setProperty(c.varName, v + 'px');
+    if (persist) lsSet(c.key, String(v));
+    return v;
+  }
+
+  // restore saved widths as early as possible so there is no visible jump on load
+  function restoreWidths() {
+    Object.keys(COLS).forEach(function (name) {
+      const c = COLS[name];
+      const saved = parseFloat(lsGet(c.key));
+      if (isFinite(saved)) {
+        const v = Math.max(c.min, Math.min(c.max, Math.round(saved)));
+        document.documentElement.style.setProperty(c.varName, v + 'px');
+      }
+    });
+  }
+
+  function wireSplitter(elm) {
+    const name = elm.getAttribute('data-splitter');
+    if (!COLS[name]) return;
+    let dragging = false;
+
+    elm.addEventListener('pointerdown', function (e) {
+      if (e.button != null && e.button !== 0) return;   // left button / touch / pen only
+      dragging = true;
+      elm.classList.add('is-dragging');
+      document.body.classList.add('is-resizing');
+      try { elm.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
+      e.preventDefault();
+    });
+
+    elm.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      const layout = document.getElementById('layout');
+      if (!layout) return;
+      const r = layout.getBoundingClientRect();
+      const px = name === 'sidebar'
+        ? (e.clientX - r.left - SPLIT_W / 2)
+        : (r.right - e.clientX - SPLIT_W / 2);
+      setWidth(name, px, false);
+      e.preventDefault();
+    });
+
+    function endDrag(e) {
+      if (!dragging) return;
+      dragging = false;
+      elm.classList.remove('is-dragging');
+      document.body.classList.remove('is-resizing');
+      try { if (e && e.pointerId != null) elm.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      lsSet(COLS[name].key, String(Math.round(currentWidth(name))));
+    }
+    elm.addEventListener('pointerup', endDrag);
+    elm.addEventListener('pointercancel', endDrag);
+    elm.addEventListener('lostpointercapture', endDrag);
+
+    // double-click = back to the default width
+    elm.addEventListener('dblclick', function (e) {
+      e.preventDefault();
+      document.documentElement.style.setProperty(COLS[name].varName, COLS[name].def + 'px');
+      lsDel(COLS[name].key);
+    });
+
+    // keyboard: the divider is a focusable role="separator"
+    elm.addEventListener('keydown', function (e) {
+      const step = e.shiftKey ? 48 : 16;
+      let px = null;
+      if (e.key === 'ArrowLeft') px = currentWidth(name) + (name === 'sidebar' ? -step : step);
+      else if (e.key === 'ArrowRight') px = currentWidth(name) + (name === 'sidebar' ? step : -step);
+      else if (e.key === 'Home' || e.key === 'Enter' || e.key === ' ') px = COLS[name].def;
+      else return;
+      e.preventDefault();
+      setWidth(name, px, true);
+    });
+  }
+
+  // keep the columns legal when the window shrinks (never let the center vanish)
+  function reclampWidths() {
+    Object.keys(COLS).forEach(function (name) { setWidth(name, currentWidth(name), false); });
+  }
+
+  // ================================================================== 2. ACCORDIONS
+  const ACC_KEY = 'am_acc';
+
+  function readAccState() {
+    try {
+      const o = JSON.parse(lsGet(ACC_KEY) || '{}');
+      return (o && typeof o === 'object') ? o : {};
+    } catch (e) { return {}; }
+  }
+  function writeAccState(map) { lsSet(ACC_KEY, JSON.stringify(map)); }
+
+  function setAccOpen(acc, open, persist) {
+    const btn = acc.querySelector('.acc-head');
+    acc.setAttribute('data-open', open ? 'true' : 'false');
+    if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (persist) {
+      const key = acc.getAttribute('data-acc');
+      if (key) { const m = readAccState(); m[key] = !!open; writeAccState(m); }
+    }
+  }
+
+  function initAccordions(root) {
+    const saved = readAccState();
+    (root || document).querySelectorAll('.acc[data-acc]').forEach(function (acc) {
+      const key = acc.getAttribute('data-acc');
+      // markup's data-open is the default; localStorage wins once the user has touched it
+      const open = Object.prototype.hasOwnProperty.call(saved, key)
+        ? !!saved[key]
+        : acc.getAttribute('data-open') === 'true';
+      setAccOpen(acc, open, false);
+    });
+  }
+
+  // one delegated listener: works for accordions added later, and <button> gives Enter/Space for free
+  function wireAccordions() {
+    document.addEventListener('click', function (e) {
+      const head = (e.target && e.target.closest) ? e.target.closest('.acc-head') : null;
+      if (!head) return;
+      const acc = head.closest('.acc');
+      if (!acc) return;
+      e.preventDefault();
+      setAccOpen(acc, acc.getAttribute('data-open') !== 'true', true);
+    });
+  }
+
+  // ================================================================== 3. NUMBER STEPPERS
+  // Wraps a bare <input type="number" class="in"> into
+  //   <div class="num-wrap"> input + <span class="num-steps"> two .num-step buttons </span></div>
+  // The ORIGINAL input node is MOVED, never replaced: its id and its oninput/onchange properties
+  // (set by renderProps/numField/pctField/...) survive untouched. Steps dispatch BOTH `input` and
+  // `change` so handlers listening to only one of them (e.g. #menu-rows) still fire.
+  const NUM_ROOTS = ['slot-editor', 'menu-settings', 'reqedit-wrap', 'center-toolbar'];
+
+  function stepOf(input) {
+    const s = parseFloat(input.getAttribute('step'));
+    return (isFinite(s) && s > 0) ? s : 1;   // step="any" / missing -> 1
+  }
+  function limOf(input, attr) {
+    const v = parseFloat(input.getAttribute(attr));
+    return isFinite(v) ? v : null;
+  }
+  function decimalsOf(step) {
+    const s = String(step);
+    const i = s.indexOf('.');
+    return i === -1 ? 0 : (s.length - i - 1);
+  }
+  function fmt(n, step) {
+    const d = decimalsOf(step);
+    return d ? String(Number(n.toFixed(d))) : String(Math.round(n));
+  }
+
+  function clampAndFire(input, min, max, step) {
+    let n = parseFloat(input.value);
+    if (isFinite(n)) {
+      if (min != null && n < min) n = min;
+      if (max != null && n > max) n = max;
+      input.value = fmt(n, step);
+    }
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // grey out an arrow once the value sits on its limit
+  function refreshSteps(input) {
+    const wrap = input.parentNode;
+    if (!wrap || !wrap.classList || !wrap.classList.contains('num-wrap')) return;
+    const up = wrap.querySelector('.num-step.up');
+    const down = wrap.querySelector('.num-step.down');
+    const min = limOf(input, 'min');
+    const max = limOf(input, 'max');
+    const n = parseFloat(input.value);
+    if (up) up.classList.toggle('is-disabled', isFinite(n) && max != null && n >= max);
+    if (down) down.classList.toggle('is-disabled', isFinite(n) && min != null && n <= min);
+  }
+
+  // One nudge. `mult` is the coarse-step factor: 1 for a plain click/arrow, 10 for Shift and PageUp/Dn.
+  // Returns true when the value actually moved (false = already sitting on min/max), which is what
+  // stops a key-repeat/hold from spinning uselessly against a limit such as «Рядов» 1..6.
+  function bump(input, dir, mult) {
+    if (input.disabled || input.readOnly) return false;
+    const step = stepOf(input) * (mult && mult > 0 ? mult : 1);
+    const min = limOf(input, 'min');
+    const max = limOf(input, 'max');
+    const before = input.value;
+    const cur = parseFloat(input.value);
+    if (!isFinite(cur)) {
+      // An EMPTY box is a real state for pctField ("key absent"), so the first press must land on the
+      // base value rather than base +/- step — otherwise «шанс» would jump straight to 0.1 instead of 0.
+      const ph = parseFloat(input.placeholder);
+      const base = isFinite(ph) ? ph : (min != null ? min : 0);
+      input.value = fmt(base, step);
+    } else {
+      input.value = fmt(cur + dir * step, step);
+    }
+    clampAndFire(input, min, max, step);
+    refreshSteps(input);
+    return input.value !== before;
+  }
+
+  function makeStep(cls, title) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'num-step ' + cls;
+    b.tabIndex = -1;
+    b.title = title;
+    return b;
+  }
+
+  // hold-to-repeat pacing: first repeat after HOLD_DELAY, then the gap shrinks geometrically down to
+  // REPEAT_MIN — that is the "ускорение" (a long hold walks a 0..64 field quickly without overshooting
+  // a 1..6 one, which stops itself as soon as the value can no longer move).
+  const HOLD_DELAY = 380, REPEAT_START = 120, REPEAT_MIN = 28, REPEAT_DECAY = 0.85;
+
+  function bindSteps(wrap) {
+    if (wrap.dataset.numBound === '1') return;
+    wrap.dataset.numBound = '1';
+    const input = wrap.querySelector('input[type="number"]');
+    if (!input) return;
+
+    wrap.querySelectorAll('.num-step').forEach(function (btn) {
+      const dir = btn.classList.contains('up') ? 1 : -1;
+      let timer = null;
+      const stop = function () { clearTimeout(timer); timer = null; };
+      btn.addEventListener('pointerdown', function (e) {
+        if (e.button != null && e.button !== 0) return;
+        // inside a <label class="field"> a click would otherwise be forwarded to the labelled control
+        e.preventDefault();
+        e.stopPropagation();
+        const mult = e.shiftKey ? 10 : 1;   // Shift+клик = шаг ×10
+        stop();
+        if (!bump(input, dir, mult)) return;   // already at the limit — nothing to repeat
+        let gap = REPEAT_START;
+        const tick = function () {
+          // a re-render may have thrown this input away mid-hold; never keep stepping a detached node
+          if (!input.isConnected || !bump(input, dir, mult)) { stop(); return; }
+          gap = Math.max(REPEAT_MIN, gap * REPEAT_DECAY);
+          timer = setTimeout(tick, gap);
+        };
+        timer = setTimeout(tick, HOLD_DELAY);
+      });
+      // NB: only listeners on the button itself — a window/document listener here would be added once
+      // per stepper and never removed, so every renderProps() would pile up another copy.
+      ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (ev) {
+        btn.addEventListener(ev, stop);
+      });
+      btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); });
+    });
+
+    // Keyboard. The native ↑/↓ of <input type=number> only fires `input`, so a field wired with
+    // .onchange alone (#menu-rows) would not commit until blur — and native stepping ignores our
+    // "empty box starts at the base value" rule. Take it over: same clamps, same both-events dispatch.
+    input.addEventListener('keydown', function (e) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      let dir = 0, mult = 1;
+      if (e.key === 'ArrowUp') dir = 1;
+      else if (e.key === 'ArrowDown') dir = -1;
+      else if (e.key === 'PageUp') { dir = 1; mult = 10; }
+      else if (e.key === 'PageDown') { dir = -1; mult = 10; }
+      else return;
+      if (e.shiftKey) mult *= 10;
+      e.preventDefault();
+      bump(input, dir, mult);
+    });
+
+    input.addEventListener('input', function () { refreshSteps(input); });
+    refreshSteps(input);
+  }
+
+  // Wrap every bare number input under `root` and (re)bind the arrows. Idempotent - safe to call
+  // after any re-render. Exposed as window.AlexMenusChrome.enhanceNumbers(root).
+  function enhanceNumbers(root) {
+    const host = root || document;
+    host.querySelectorAll('input[type="number"]').forEach(function (input) {
+      const parent = input.parentNode;
+      if (!parent) return;
+      if (parent.classList && parent.classList.contains('num-wrap')) return;   // already wrapped
+      const wrap = document.createElement('div');
+      const narrow = input.closest('.inline') || input.closest('.rows-field');
+      wrap.className = 'num-wrap' + (narrow ? ' compact' : '');
+      parent.insertBefore(wrap, input);
+      wrap.appendChild(input);
+      const steps = document.createElement('span');
+      steps.className = 'num-steps';
+      steps.setAttribute('aria-hidden', 'true');
+      steps.append(makeStep('up', 'Больше'), makeStep('down', 'Меньше'));
+      wrap.appendChild(steps);
+    });
+    host.querySelectorAll('.num-wrap').forEach(function (wrap) {
+      bindSteps(wrap);
+      // values are often set programmatically (renderTitleRows / renderMenuSettings / ...) without
+      // firing `input`, so refresh the at-limit greying on every pass, not only on first bind
+      const n = wrap.querySelector('input[type="number"]');
+      if (n) refreshSteps(n);
+    });
+  }
+
+  // Dynamic fields are rebuilt by renderProps()/renderActionList()/... on every edit. Rather than
+  // patching those functions, watch their hosts and re-decorate whatever appears. The pass is
+  // idempotent, so the mutations it causes settle on the next frame instead of looping.
+  function watchNumbers() {
+    if (typeof MutationObserver !== 'function') return;
+    let queued = false;
+    const obs = new MutationObserver(function () {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(function () {
+        queued = false;
+        NUM_ROOTS.forEach(function (id) {
+          const n = document.getElementById(id);
+          if (n) enhanceNumbers(n);
+        });
+      });
+    });
+    NUM_ROOTS.forEach(function (id) {
+      const n = document.getElementById(id);
+      if (n) obs.observe(n, { childList: true, subtree: true });
+    });
+  }
+
+  // ================================================================== boot
+  restoreWidths();   // before first paint - no width flash
+
+  function boot() {
+    document.querySelectorAll('.splitter[data-splitter]').forEach(wireSplitter);
+    window.addEventListener('resize', reclampWidths);
+
+    initAccordions(document);
+    wireAccordions();
+
+    NUM_ROOTS.forEach(function (id) {
+      const n = document.getElementById(id);
+      if (n) enhanceNumbers(n);
+    });
+    watchNumbers();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+
+  // public hook for the rest of the app (e.g. after a manual re-render outside NUM_ROOTS)
+  window.AlexMenusChrome = {
+    enhanceNumbers: enhanceNumbers,
+    setColumnWidth: setWidth,
+    setAccordion: function (key, open) {
+      const acc = document.querySelector('.acc[data-acc="' + key + '"]');
+      if (acc) setAccOpen(acc, !!open, true);
+    }
+  };
 })();
