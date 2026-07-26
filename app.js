@@ -78,12 +78,19 @@
     'HIDE_DYE', 'HIDE_ARMOR_TRIM', 'HIDE_DESTROYS', 'HIDE_PLACED_ON'
   ];
 
-  // action type -> Russian label (order = <select> order)
+  // action type -> Russian label (order = <select> order). Mirrors ActionHandler.dispatch():
+  // messaging, economy/exp, items, slot manipulation (input slots), flow control.
   const ACTION_TYPES = [
-    ['run_command', 'Команда'], ['message', 'Сообщение'], ['actionbar', 'Actionbar'],
+    ['run_command', 'Команда'], ['message', 'Сообщение'], ['broadcast', 'Объявление всем (broadcast)'],
+    ['actionbar', 'Actionbar'],
     ['title', 'Заголовок (title)'], ['open_menu', 'Открыть меню'], ['connect', 'Сервер (connect)'],
-    ['sound', 'Звук'], ['give_item', 'Выдать предмет'],
+    ['sound', 'Звук'], ['give_item', 'Выдать предмет'], ['take_item', 'Списать предмет (take_item)'],
+    ['give_money', 'Выдать деньги'], ['take_money', 'Забрать деньги'],
+    ['give_exp', 'Выдать опыт'], ['take_exp', 'Забрать опыт'],
     ['give_permission', 'Выдать право'], ['take_permission', 'Забрать право'],
+    ['set_slot', 'Задать слот (set_slot)'], ['modify_slot', 'Изменить слот (modify_slot)'],
+    ['clear_slot', 'Очистить слот (clear_slot)'], ['give_slot', 'Отдать слот игроку (give_slot)'],
+    ['outcome', 'Случайный исход (outcome)'],
     ['refresh', 'Обновить'], ['close', 'Закрыть'], ['back', 'Назад'], ['conditional', 'Условие (JSON)']
   ];
 
@@ -507,12 +514,28 @@
       cell.classList.add('filled');
       cell.append(makeItemIconHolder(item, 58, 'cell-txt', true));
     }
+    if (isInputItem(item)) markInputCell(cell);
     if (state.selected.has(slot)) cell.classList.add('selected');
     if (state.active === slot) cell.classList.add('active');
     cell.addEventListener('mousedown', (e) => onCellMouseDown(e, slot));
     cell.addEventListener('mouseenter', (e) => onCellMouseEnter(e, slot));
     cell.addEventListener('contextmenu', (e) => onCellContext(e, slot));
     return cell;
+  }
+
+  // an element is an INPUT slot as soon as it carries an `input:` map (the plugin's own marker)
+  function isInputItem(it) { return !!(it && typeof it === 'object' && it.input && typeof it.input === 'object'); }
+  // visual marker for an input slot: dashed border + a small ⇩ badge. Styled inline on purpose —
+  // style.css is not part of this change — and deliberately NOT via box-shadow, which would fight
+  // the .selected/.active rings.
+  function markInputCell(cell) {
+    cell.classList.add('input-slot');
+    cell.title = 'Input-слот: игрок кладёт сюда свои вещи';
+    cell.style.borderStyle = 'dashed';
+    const badge = el('span', 'cell-input-badge', '⇩');
+    badge.style.cssText = 'position:absolute;right:3px;bottom:2px;font-size:11px;line-height:1;'
+      + 'color:var(--accent);font-family:var(--mono);pointer-events:none;';
+    cell.append(badge);
   }
 
   // ---------- selection interactions ----------
@@ -648,10 +671,203 @@
       else it.lore = fLore.value.split('\n');
     }, false);
 
+    renderSlotMode(disp);           // обычный предмет / input-слот (+ the input editor)
     renderHeadFields(disp);
     renderFlags(disp);
     renderClicks(disp);
     renderSlotRequirements(disp);   // view-requirement + click-requirement builders (bulk-aware)
+  }
+
+  // ================================================================== INPUT SLOTS (element key `input:`)
+  // An input slot is a slot the PLAYER puts their own items into, so every write below targets the
+  // ACTIVE slot only — never the bulk selection. Two reasons: (1) mass-applying an item-consuming
+  // config from a stray multi-select is how people lose gear, and (2) none of this markup lives inside
+  // #f-clicks, so the propagateClicks() keystroke path (which deep-clones the whole clicks object onto
+  // every selected slot) can never pick these keys up.
+  function renderSlotMode(disp) {
+    const it = activeItemObj();
+    const isInput = isInputItem(it);
+    const bItem = $('f-mode-item'), bInput = $('f-mode-input');
+    if (!bItem || !bInput) return;
+    bItem.classList.toggle('primary', !isInput);
+    bInput.classList.toggle('primary', isInput);
+    bItem.setAttribute('aria-pressed', isInput ? 'false' : 'true');
+    bInput.setAttribute('aria-pressed', isInput ? 'true' : 'false');
+    bItem.onclick = () => setSlotMode(false);
+    bInput.onclick = () => setSlotMode(true);
+
+    const hint = $('f-mode-hint');
+    if (hint) {
+      hint.textContent = isInput
+        ? 'Игрок кладёт сюда свои вещи. Настройки input применяются ТОЛЬКО к активному слоту, даже при мультивыделении.'
+        : 'Обычный предмет: клики выполняют действия из списка ниже.';
+    }
+    const note = $('req-view-input-note');
+    if (note) note.hidden = !isInput;
+
+    const wrap = $('f-input-wrap');
+    if (!wrap) return;
+    wrap.hidden = !isInput;
+    if (isInput) renderInputEditor(wrap, it);
+    else clear(wrap);
+  }
+
+  // toggle the active slot between a plain item and an input slot (presence of `input:` IS the mode)
+  function setSlotMode(toInput) {
+    const it = activeItemObj();
+    if (!it) return;
+    if (toInput) { if (!isInputItem(it)) it.input = {}; }
+    else delete it.input;
+    renderGrid();     // the cell marker changes
+    renderProps();
+  }
+
+  function renderInputEditor(host, it) {
+    clear(host);
+    const m = current();
+    if (!isInputItem(it)) it.input = {};
+    const inp = it.input;
+
+    // parser rules the plugin enforces — surfaced here so nothing dies silently in the server log
+    const warn = el('div', 'input-warn');
+    warn.style.cssText = 'display:flex;flex-direction:column;gap:4px;font-size:12px;line-height:1.35;'
+      + 'color:var(--muted);border:1px solid var(--border);border-left:2px solid var(--accent);'
+      + 'border-radius:6px;padding:7px 9px;';
+    const lines = ['Действия on-insert / on-extract / on-reject срабатывают на вложение, изъятие и отказ фильтра.'];
+    if (m && (m.obj.type || 'chest') === 'inventory') {
+      lines.push('⚠ Тип меню «inventory» не поддерживает input-слоты — плагин выбросит этот элемент.');
+    }
+    const iv = m ? parseInt(m.obj['update-interval'], 10) : NaN;
+    if (!isNaN(iv) && iv > 0) lines.push('⚠ update-interval меню будет принудительно обнулён (живое обновление затирало бы вещи игрока).');
+    if (it['view-requirement'] != null) lines.push('⚠ view-requirement на input-слоте игнорируется — скрытый слот терял бы вещи.');
+    lines.forEach((s) => warn.append(el('span', null, s)));
+    host.append(warn);
+
+    // ---- accept: OR-list of filters (empty/absent = accept anything) ----
+    host.append(el('span', 'req-sub-lbl', 'Фильтры приёма (accept) — OR-список, пусто = принимать что угодно'));
+    const accHost = el('div', 'input-accept');
+    host.append(accHost);
+    renderAcceptList(accHost, inp);
+
+    // ---- max-amount / lock-extract ----
+    host.append(pctField('Максимум предметов (max-amount)', inp['max-amount'],
+      (v) => setOrDel(inp, 'max-amount', v), { min: 1, max: 64, step: 1, placeholder: '1' }));
+    host.append(checkField('Забрать нельзя (lock-extract)', inp['lock-extract'] === true,
+      (on) => { if (on) inp['lock-extract'] = true; else delete inp['lock-extract']; }));
+
+    // ---- placeholder {material, name}: what the slot shows while it is empty ----
+    host.append(el('span', 'req-sub-lbl', 'Заглушка пустого слота (placeholder)'));
+    const ph = (inp.placeholder && typeof inp.placeholder === 'object') ? inp.placeholder : {};
+    const phIc = el('span', 'mat-ic');
+    const phMat = document.createElement('input');
+    phMat.type = 'text'; phMat.className = 'in';
+    phMat.placeholder = 'GRAY_STAINED_GLASS_PANE (пусто — без заглушки)';
+    phMat.value = ph.material != null ? String(ph.material) : '';
+    const phName = document.createElement('input');
+    phName.type = 'text'; phName.className = 'in';
+    phName.placeholder = '&7Положи инструмент';
+    phName.value = ph.name != null ? String(ph.name) : '';
+    const syncPh = () => {
+      const mat = phMat.value.trim();
+      if (!mat) { delete inp.placeholder; return; }     // no material -> no placeholder at all
+      const spec = { material: mat };
+      const nm = phName.value.trim(); if (nm) spec.name = nm;
+      inp.placeholder = spec;
+    };
+    phMat.oninput = () => { syncPh(); setMatIconEl(phIc, phMat.value.trim()); };
+    phName.oninput = syncPh;
+    const phPick = el('button', 'btn small', 'Выбрать…');
+    phPick.type = 'button';
+    phPick.onclick = () => openMaterialPickerFor((mat) => { phMat.value = mat; syncPh(); setMatIconEl(phIc, mat); });
+    const phRow = el('div', 'mat-row');
+    phRow.append(phIc, phMat, phPick);
+    setMatIconEl(phIc, ph.material);
+    host.append(labelWrap('Материал заглушки', phRow));
+    host.append(labelWrap('Имя заглушки (цвета &c, &#RRGGBB, #RRGGBB)', phName));
+
+    // ---- on-insert / on-extract / on-reject action lists ----
+    [['on-insert', 'При вложении (on-insert)'],
+     ['on-extract', 'При изъятии (on-extract)'],
+     ['on-reject', 'Отказ фильтра (on-reject)']].forEach(([key, label]) => {
+      host.append(el('span', 'req-sub-lbl', label));
+      // work on a live array but only WRITE the key while it is non-empty (no `on-insert: []` cruft)
+      const arr = Array.isArray(inp[key]) ? inp[key] : [];
+      const commit = () => { if (arr.length) inp[key] = arr; else delete inp[key]; };
+      const box = el('div', 'req-actions');
+      box.addEventListener('input', commit);
+      box.addEventListener('change', commit);
+      host.append(box);
+      renderActionList(box, arr, commit);
+    });
+  }
+
+  // accept-filter list: each entry is an OR-alternative; an item passes when ANY filter matches
+  function renderAcceptList(host, inp) {
+    clear(host);
+    const list = Array.isArray(inp.accept) ? inp.accept : [];
+    list.forEach((f, i) => host.append(buildAcceptRow(host, inp, list, i)));
+    const add = el('button', 'btn small add-action', '＋ фильтр');
+    add.type = 'button';
+    add.onclick = () => {
+      const arr = Array.isArray(inp.accept) ? inp.accept : (inp.accept = []);
+      arr.push({});
+      renderAcceptList(host, inp);
+    };
+    host.append(add);
+  }
+
+  function buildAcceptRow(host, inp, list, idx) {
+    if (!list[idx] || typeof list[idx] !== 'object') list[idx] = {};
+    const f = list[idx];
+    const row = el('div', 'action-row');
+
+    const top = el('div', 'action-top');
+    top.append(el('span', 'ck-name', 'Фильтр ' + (idx + 1)));
+    const del = el('button', 'btn icon', '×');
+    del.type = 'button'; del.title = 'Удалить фильтр';
+    del.onclick = () => {
+      list.splice(idx, 1);
+      if (!list.length) delete inp.accept;              // last one removed -> the key goes away
+      renderAcceptList(host, inp);
+    };
+    top.append(del);
+    row.append(top);
+
+    const fields = el('div', 'action-fields');
+    // material: a single value stays a bare string, several become a list (both are accepted)
+    const matInp = document.createElement('input');
+    matInp.type = 'text'; matInp.className = 'in';
+    matInp.placeholder = 'DIAMOND_SWORD, NETHERITE_SWORD (пусто — любой)';
+    matInp.value = listToText(f.material);
+    matInp.oninput = () => setListOrDel(f, 'material', matInp.value);
+    const matPick = el('button', 'btn small', 'Выбрать…');
+    matPick.type = 'button';
+    matPick.onclick = () => openMaterialPickerFor((mat) => {   // append, don't replace: it is an OR-list
+      const cur = matInp.value.trim().replace(/,\s*$/, '');
+      matInp.value = cur ? cur + ', ' + mat : mat;
+      setListOrDel(f, 'material', matInp.value);
+    });
+    const matRow = el('div', 'mat-row');
+    matRow.append(matInp, matPick);
+    fields.append(labelWrap('Материалы (material)', matRow));
+
+    fields.append(textField('Имя точно (name-equals)', f['name-equals'], (v) => setOrDel(f, 'name-equals', v)));
+    fields.append(textField('Имя содержит (name-contains)', f['name-contains'], (v) => setOrDel(f, 'name-contains', v)));
+    fields.append(linesField('Лор содержит (lore-contains, по строке)', f['lore-contains'],
+      (v) => setOrDel(f, 'lore-contains', v ? v.map((s) => s.trim()).filter(Boolean) : null), 'Уровень'));
+
+    const line = el('div', 'inline');
+    line.append(textField('custom-model-data (cmd)', f.cmd, (v) => setOrDel(f, 'cmd', v)));
+    line.append(pctField('Мин. кол-во (min-amount)', f['min-amount'],
+      (v) => setOrDel(f, 'min-amount', v), { min: 1, max: 64, step: 1, placeholder: '1' }));
+    fields.append(line);
+
+    fields.append(textField('PDC-тег (tag: namespace:key)', f.tag, (v) => setOrDel(f, 'tag', v)));
+    fields.append(textField('Чары, мин. уровни (enchants): DAMAGE_ALL: 4, DURABILITY: 2',
+      enchToText(f.enchants), (v) => setOrDel(f, 'enchants', parseEnch(v))));
+
+    row.append(fields);
+    return row;
   }
 
   function renderFlags(disp) {
@@ -731,7 +947,15 @@
       sel.append(o);
     });
     sel.value = a.type || 'run_command';
-    sel.onchange = () => { actions[idx] = defaultAction(sel.value); propagateClicksIfBulk(); renderProps(); };
+    sel.onchange = () => {
+      // `chance` is type-agnostic — carry it across the reset so switching type doesn't silently
+      // turn a 12.5%-chance action into an always-fires one.
+      const keep = actions[idx].chance;
+      actions[idx] = defaultAction(sel.value);
+      if (keep != null) actions[idx].chance = keep;
+      propagateClicksIfBulk();
+      renderProps();
+    };
 
     const del = el('button', 'btn icon', '×');
     del.title = 'Удалить действие';
@@ -746,39 +970,64 @@
     row.append(top);
 
     const fields = el('div', 'action-fields');
-    buildActionFields(fields, a); // field inputs mutate `a`; #f-clicks delegated listener propagates
+    // field inputs mutate `a`; #f-clicks delegated listener propagates. Structural edits inside
+    // nested lists (outcome branches) go through the same bulk-propagate path.
+    buildActionFields(fields, a, propagateClicksIfBulk);
     row.append(fields);
     return row;
   }
+
+  // slot number a freshly added slot-action should point at (the slot being edited, when there is one)
+  function defaultSlotNum() { return state.active != null ? state.active : 0; }
 
   function defaultAction(type) {
     switch (type) {
       case 'run_command': return { type, command: '', as: 'player' };
       case 'message': return { type, text: '' };
+      case 'broadcast': return { type, text: '' };
       case 'actionbar': return { type, text: '' };
       case 'title': return { type, title: '', subtitle: '', 'fade-in': 10, stay: 40, 'fade-out': 10 };
       case 'open_menu': return { type, menu: '' };
       case 'connect': return { type, server: '' };
       case 'sound': return { type, sound: '' };
       case 'give_item': return { type, material: 'STONE', amount: 1 };
+      case 'take_item': return { type, material: 'STONE', amount: 1 };
+      case 'give_money': return { type, amount: 100 };
+      case 'take_money': return { type, amount: 100 };
+      case 'give_exp': return { type, amount: 1 };
+      case 'take_exp': return { type, amount: 1 };
       case 'give_permission': return { type, permission: '' };
       case 'take_permission': return { type, permission: '' };
+      case 'set_slot': return { type, slot: defaultSlotNum(), material: 'STONE', amount: 1 };
+      case 'modify_slot': return { type, slot: defaultSlotNum() };
+      case 'clear_slot': return { type, slot: defaultSlotNum() };
+      case 'give_slot': return { type, slot: defaultSlotNum() };
+      case 'outcome': return { type, outcomes: [] };
       case 'conditional': return { type, requirement: '', then: [], else: [] };
       default: return { type }; // refresh, close, back
     }
   }
 
-  // build the per-type field inputs for one action; each input mutates `a` directly
-  function buildActionFields(box, a) {
+  // Build the per-type field inputs for one action; each input mutates `a` directly.
+  // `onStruct` (optional) is called after STRUCTURAL edits inside nested lists (outcome branches),
+  // where a plain `input` event isn't enough for the caller to notice.
+  function buildActionFields(box, a, onStruct) {
+    const struct = (typeof onStruct === 'function') ? onStruct : function () { /* noop */ };
     const t = a.type;
+
+    // `chance` is valid on EVERY action type, so it is built BEFORE the per-type branches.
+    // Empty box = no key at all (the plugin treats a missing chance as "always"); 0 = never.
+    box.append(pctField('Шанс, % (пусто — всегда)', a.chance, (v) => setOrDel(a, 'chance', v),
+      { min: 0, max: 100, step: 0.1, placeholder: '100' }));
+
     if (t === 'run_command') {
       box.append(textField('Команда (без /)', a.command, (v) => { a.command = v; }));
       box.append(selectField('От имени', a.as || 'player',
         [['player', 'игрок'], ['console', 'консоль']], (v) => { a.as = v; }));
-    } else if (t === 'message') {
-      box.append(textField('Текст (MiniMessage)', a.text, (v) => { a.text = v; }));
+    } else if (t === 'message' || t === 'broadcast') {
+      box.append(textField('Текст (цвета &c, &#RRGGBB, #RRGGBB)', a.text, (v) => { a.text = v; }));
     } else if (t === 'actionbar') {
-      box.append(textField('Текст (MiniMessage)', a.text, (v) => { a.text = v; }));
+      box.append(textField('Текст (цвета &c, &#RRGGBB, #RRGGBB)', a.text, (v) => { a.text = v; }));
     } else if (t === 'title') {
       box.append(textField('Заголовок (title)', a.title, (v) => { a.title = v; }));
       box.append(textField('Подзаголовок (subtitle)', a.subtitle, (v) => { a.subtitle = v; }));
@@ -795,13 +1044,56 @@
       box.append(textField('Звук', a.sound, (v) => { a.sound = v; }));
     } else if (t === 'give_permission' || t === 'take_permission') {
       box.append(textField('Право (permission)', a.permission, (v) => { a.permission = v; }));
-    } else if (t === 'give_item') {
-      const line = el('div', 'inline');
-      line.append(textField('Материал', a.material, (v) => { a.material = v; }));
-      line.append(numField('Кол-во', a.amount, (v) => { a.amount = v; }));
-      box.append(line);
-      box.append(textField('Имя (необяз.)', a.name, (v) => { setOrDel(a, 'name', v); }));
-      box.append(textField('cmd (необяз.)', a.cmd, (v) => { setOrDel(a, 'cmd', v); }));
+    } else if (t === 'give_item' || t === 'take_item') {
+      box.append(materialField('Материал', a.material, (v) => { a.material = v; }, 'DIAMOND'));
+      box.append(numField('Кол-во', a.amount, (v) => { a.amount = v; }));
+      if (t === 'give_item') {
+        box.append(textField('Имя (необяз.)', a.name, (v) => { setOrDel(a, 'name', v); }));
+        box.append(textField('cmd (необяз.)', a.cmd, (v) => { setOrDel(a, 'cmd', v); }));
+      }
+    } else if (t === 'give_money' || t === 'take_money') {
+      box.append(pctField('Сумма (Vault)', a.amount, (v) => setOrDel(a, 'amount', v),
+        { min: 0, max: 1e9, step: 0.01, placeholder: '100' }));
+    } else if (t === 'give_exp' || t === 'take_exp') {
+      box.append(pctField('Кол-во', a.amount, (v) => setOrDel(a, 'amount', v),
+        { min: 0, max: 1e9, step: 1, placeholder: '1' }));
+      box.append(checkField('В уровнях (level)', a.level === true,
+        (on) => { if (on) a.level = true; else delete a.level; }));
+    } else if (t === 'clear_slot' || t === 'give_slot') {
+      box.append(slotNumField(a));
+    } else if (t === 'set_slot') {
+      // set_slot REPLACES the slot contents wholesale (NBT of whatever was there is dropped)
+      box.append(slotNumField(a));
+      box.append(materialField('Материал', a.material, (v) => { a.material = v; }, 'DIAMOND_SWORD'));
+      box.append(numField('Кол-во', a.amount, (v) => { a.amount = v; }));
+      box.append(textField('Имя (необяз., цвета &c / #RRGGBB)', a.name, (v) => setOrDel(a, 'name', v)));
+      box.append(linesField('Лор (по строке на ряд)', a.lore, (v) => setOrDel(a, 'lore', v), '&7Строка лора'));
+      box.append(textField('cmd (необяз.)', a.cmd, (v) => setOrDel(a, 'cmd', v)));
+    } else if (t === 'modify_slot') {
+      // modify_slot EDITS the existing stack in place (keeps NBT) — the forge/upgrade workhorse
+      box.append(slotNumField(a));
+      box.append(materialField('Сменить материал (set-material)', a['set-material'],
+        (v) => setOrDel(a, 'set-material', v), 'не менять'));
+      box.append(textField('Сменить имя (set-name)', a['set-name'], (v) => setOrDel(a, 'set-name', v)));
+      box.append(linesField('Заменить лор (set-lore)', a['set-lore'], (v) => setOrDel(a, 'set-lore', v), '&7Новый лор'));
+      box.append(linesField('Дописать лор (add-lore)', a['add-lore'], (v) => setOrDel(a, 'add-lore', v), '&aУлучшено'));
+      box.append(textField('Выдать чары (add-enchant), напр. DAMAGE_ALL: 4, DURABILITY: 2',
+        enchToText(a['add-enchant']), (v) => setOrDel(a, 'add-enchant', parseEnch(v))));
+      box.append(textField('Снять чары (remove-enchant), через запятую',
+        listToText(a['remove-enchant']), (v) => setListOrDel(a, 'remove-enchant', v, true)));
+      const amtLine = el('div', 'inline');
+      amtLine.append(pctField('Задать кол-во (set-amount)', a['set-amount'],
+        (v) => setOrDel(a, 'set-amount', v), { min: 1, max: 64, step: 1, placeholder: '—' }));
+      amtLine.append(pctField('Изменить кол-во (add-amount)', a['add-amount'],
+        (v) => setOrDel(a, 'add-amount', v), { min: -64, max: 64, step: 1, placeholder: '±0' }));
+      box.append(amtLine);
+      const miscLine = el('div', 'inline');
+      miscLine.append(textField('Задать cmd (set-cmd)', a['set-cmd'], (v) => setOrDel(a, 'set-cmd', v)));
+      miscLine.append(pctField('Прочность (damage)', a.damage, (v) => setOrDel(a, 'damage', v),
+        { min: -32768, max: 32768, step: 1, placeholder: '±0' }));
+      box.append(miscLine);
+    } else if (t === 'outcome') {
+      buildOutcomeEditor(box, a, struct);
     } else if (t === 'conditional') {
       // raw-JSON escape hatch for the requirement + then/else branches
       const ta = document.createElement('textarea');
@@ -825,10 +1117,77 @@
     // refresh, close, back -> no fields
   }
 
+  // ---------- outcome: weighted branches, exactly ONE of them runs ----------
+  // Weights are NOT percentages — they are normalised against their sum, so the row header shows the
+  // resolved probability. Each branch owns a nested action list (rendered by the same renderActionList),
+  // which is why chance/delay keep working inside a branch: the plugin re-enters run(...) per action.
+  function buildOutcomeEditor(box, a, onStruct) {
+    if (!Array.isArray(a.outcomes)) a.outcomes = [];
+    const host = el('div', 'outcome-list');
+    // fieldWrap, NOT labelWrap: a <label> forwards stray clicks to its first labelable descendant,
+    // which here would be a branch's «×» delete button — clicking the caption would drop a branch.
+    box.append(fieldWrap('Ветки (outcomes) — сработает ровно одна, веса нормируются', host));
+    renderOutcomeList(host, a.outcomes, onStruct);
+  }
+
+  function renderOutcomeList(host, outcomes, onStruct) {
+    clear(host);
+    const heads = [];   // per-branch header spans, refreshed live so weights show real percentages
+    const refreshPcts = () => {
+      let total = 0;
+      outcomes.forEach((o) => { const w = Number(o && o.weight != null ? o.weight : 1); if (isFinite(w) && w > 0) total += w; });
+      heads.forEach((h, i) => {
+        const o = outcomes[i] || {};
+        const w = Number(o.weight != null ? o.weight : 1);
+        const pct = (total > 0 && isFinite(w) && w > 0) ? Math.round((w / total) * 1000) / 10 : 0;
+        h.textContent = 'Ветка ' + (i + 1) + ' · ' + pct + '%';
+      });
+    };
+
+    outcomes.forEach((raw, idx) => {
+      if (!raw || typeof raw !== 'object') outcomes[idx] = {};
+      const o = outcomes[idx];
+      if (!Array.isArray(o.actions)) o.actions = [];
+
+      const row = el('div', 'action-row');
+      const top = el('div', 'action-top');
+      const head = el('span', 'ck-name', 'Ветка ' + (idx + 1));
+      heads.push(head);
+      const del = el('button', 'btn icon', '×');
+      del.type = 'button'; del.title = 'Удалить ветку';
+      del.onclick = () => { outcomes.splice(idx, 1); onStruct(); renderOutcomeList(host, outcomes, onStruct); };
+      top.append(head, del);
+      row.append(top);
+
+      const fields = el('div', 'action-fields');
+      fields.append(pctField('Вес (weight, пусто — 1)', o.weight,
+        (v) => { setOrDel(o, 'weight', v); refreshPcts(); }, { min: 0, max: 1e6, step: 1, placeholder: '1' }));
+      fields.append(el('span', 'req-sub-lbl', 'Действия ветки'));
+      const acts = el('div', 'req-actions');
+      fields.append(acts);
+      row.append(fields);
+      host.append(row);
+      renderActionList(acts, o.actions, onStruct);
+    });
+
+    const add = el('button', 'btn small add-action', '＋ ветка');
+    add.type = 'button';
+    add.onclick = () => { outcomes.push({ weight: 1, actions: [] }); onStruct(); renderOutcomeList(host, outcomes, onStruct); };
+    host.append(add);
+    refreshPcts();
+  }
+
   // ---------- small field factories ----------
   function labelWrap(label, inputNode) {
     const f = el('label', 'field');
     f.append(el('span', 'lbl', label), inputNode);
+    return f;
+  }
+  // same look, plain <div>: for captions over a GROUP of controls, where a <label> would forward
+  // clicks on the caption to the first control inside (a delete button, say)
+  function fieldWrap(label, node) {
+    const f = el('div', 'field');
+    f.append(el('span', 'lbl', label), node);
     return f;
   }
   function textField(label, val, onset) {
@@ -845,6 +1204,68 @@
     inp.oninput = () => { let n = parseInt(inp.value, 10); onset(isNaN(n) ? 1 : n); };
     return labelWrap(label, inp);
   }
+  // OPTIONAL number field (min/max/step configurable; defaults 0..100 step .1 — the `chance` shape).
+  // numField() is unusable for these: its hard min=1 and "empty -> 1" make both `chance: 0` and
+  // "no key at all" impossible to express. Here an EMPTY box calls onset(null) so the caller can
+  // setOrDel() the key away instead of bloating the YAML with defaults.
+  function pctField(label, val, onset, opts) {
+    opts = opts || {};
+    const min = opts.min != null ? opts.min : 0;
+    const max = opts.max != null ? opts.max : 100;
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.className = 'in';
+    inp.min = String(min); inp.max = String(max);
+    inp.step = String(opts.step != null ? opts.step : 0.1);
+    if (opts.placeholder != null) inp.placeholder = String(opts.placeholder);
+    inp.value = (val != null && String(val).trim() !== '') ? String(val) : '';
+    const read = () => {
+      const raw = inp.value.trim();
+      if (raw === '') return null;                       // empty is a real state: "key absent"
+      const n = Number(raw);
+      if (!isFinite(n)) return null;
+      return Math.max(min, Math.min(max, n));
+    };
+    inp.oninput = () => onset(read());
+    // normalise the visible text to the clamped value once the user leaves the box
+    inp.onchange = () => { const n = read(); if (n != null && String(n) !== inp.value.trim()) inp.value = String(n); onset(n); };
+    return labelWrap(label, inp);
+  }
+  function checkField(label, checked, onset) {
+    const lab = el('label', 'check');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = !!checked;
+    cb.onchange = () => onset(cb.checked);
+    lab.append(cb, el('span', null, label));
+    return lab;
+  }
+  // text input + «Выбрать…» button wired to the shared material picker
+  function materialField(label, val, onset, placeholder) {
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'in';
+    inp.value = val != null ? String(val) : '';
+    if (placeholder) inp.placeholder = String(placeholder);
+    inp.oninput = () => onset(inp.value);
+    const pick = el('button', 'btn small', 'Выбрать…');
+    pick.type = 'button';
+    pick.onclick = () => openMaterialPickerFor((mat) => { inp.value = mat; onset(mat); });
+    const row = el('div', 'mat-row');
+    row.append(inp, pick);
+    return labelWrap(label, row);
+  }
+  // multi-line text <-> string[]; empty text -> onset(null) so the caller drops the key
+  function linesField(label, val, onset, placeholder) {
+    const ta = document.createElement('textarea');
+    ta.className = 'in area'; ta.rows = 2; ta.spellcheck = false;
+    if (placeholder) ta.placeholder = String(placeholder);
+    ta.value = Array.isArray(val) ? val.join('\n') : (val != null ? String(val) : '');
+    ta.oninput = () => onset(ta.value.trim() === '' ? null : ta.value.split('\n'));
+    return labelWrap(label, ta);
+  }
+  // `slot:` field shared by set_slot / modify_slot / clear_slot / give_slot
+  function slotNumField(a) {
+    return pctField('Слот (номер в меню)', a.slot, (v) => setOrDel(a, 'slot', v),
+      { min: 0, max: 53, step: 1, placeholder: String(defaultSlotNum()) });
+  }
   function selectField(label, val, opts, onset) {
     const sel = el('select', 'in');
     opts.forEach(([v, l]) => {
@@ -853,6 +1274,34 @@
     sel.value = val;
     sel.onchange = () => onset(sel.value);
     return labelWrap(label, sel);
+  }
+  // "A, B" <-> "A" | ["A","B"] — the plugin accepts a bare string or a list, so a single entry stays scalar
+  function listToText(v) {
+    if (Array.isArray(v)) return v.join(', ');
+    return v != null ? String(v) : '';
+  }
+  function setListOrDel(obj, key, text, forceArray) {
+    const arr = String(text == null ? '' : text).split(',').map((s) => s.trim()).filter(Boolean);
+    if (!arr.length) delete obj[key];
+    else if (arr.length === 1 && !forceArray) obj[key] = arr[0];
+    else obj[key] = arr;
+  }
+  // { DAMAGE_ALL: 4 } <-> "DAMAGE_ALL: 4, DURABILITY: 2"
+  function enchToText(v) {
+    if (!v || typeof v !== 'object') return '';
+    return Object.keys(v).map((k) => k + ': ' + v[k]).join(', ');
+  }
+  function parseEnch(text) {
+    const out = {};
+    String(text == null ? '' : text).split(',').forEach((part) => {
+      const p = part.trim();
+      if (!p) return;
+      const i = p.indexOf(':');
+      const name = (i >= 0 ? p.slice(0, i) : p).trim();
+      const lvl = i >= 0 ? parseInt(p.slice(i + 1), 10) : 1;
+      if (name) out[name] = isNaN(lvl) ? 1 : lvl;
+    });
+    return Object.keys(out).length ? out : null;
   }
   // set obj[key]=val, or delete the key when the value is empty (keeps YAML tidy)
   function setOrDel(obj, key, val) {
@@ -909,6 +1358,10 @@
     const a = activeItem();
     return (a && a.material != null && String(a.material).trim() !== '') ? a.material : null;
   }
+  // Single birth point for a slot element. Every "create the item here" path goes through this, so a
+  // new element is ALWAYS a plain item (no `input:` key) — input mode is opted into per slot, never
+  // inherited by a slot that a bulk edit happened to materialise.
+  function newItem(mat) { return { material: mat }; }
   // element objects for every target slot. Missing items are created with creationMaterial(); if
   // there is no chosen material, the empty slot is SKIPPED — we never invent a STONE placeholder.
   function targetItems() {
@@ -921,7 +1374,7 @@
       const k = String(slot);
       if (!m.obj.items[k]) {
         if (mat == null) return;
-        m.obj.items[k] = { material: mat };
+        m.obj.items[k] = newItem(mat);
       }
       out.push(m.obj.items[k]);
     });
@@ -944,7 +1397,7 @@
       const k = String(s);
       if (empty) delete m.obj.items[k];              // clearing the material removes the item (no phantom {material:''})
       else if (m.obj.items[k]) { m.obj.items[k].material = val; stripHeadIfNotHead(m.obj.items[k]); }
-      else m.obj.items[k] = { material: val };
+      else m.obj.items[k] = newItem(val);
     });
     updateSelCounter();
     if (filledCount() !== before) renderGrid();
@@ -958,7 +1411,7 @@
     slots.forEach((s) => {
       const k = String(s);
       if (m.obj.items[k]) { m.obj.items[k].material = mat; stripHeadIfNotHead(m.obj.items[k]); }
-      else m.obj.items[k] = { material: mat };
+      else m.obj.items[k] = newItem(mat);
     });
   }
   function filledCount() {
@@ -1195,13 +1648,20 @@
     const sel = el('select', 'in');
     ACTION_TYPES.forEach(([val, lab]) => { const o = document.createElement('option'); o.value = val; o.textContent = lab; sel.append(o); });
     sel.value = a.type || 'message';
-    sel.onchange = () => { actions[idx] = defaultAction(sel.value); onChange(); renderActionList(host, actions, onChange); };
+    sel.onchange = () => {
+      // keep the type-agnostic `chance` across the reset (see buildActionRow)
+      const keep = actions[idx].chance;
+      actions[idx] = defaultAction(sel.value);
+      if (keep != null) actions[idx].chance = keep;
+      onChange();
+      renderActionList(host, actions, onChange);
+    };
     const del = el('button', 'btn icon', '×'); del.type = 'button'; del.title = 'Удалить действие';
     del.onclick = () => { actions.splice(idx, 1); onChange(); renderActionList(host, actions, onChange); };
     top.append(sel, del);
     row.append(top);
     const fields = el('div', 'action-fields');
-    buildActionFields(fields, a);   // reuses the clicks field editor; mutates `a` in place
+    buildActionFields(fields, a, onChange);   // reuses the clicks field editor; mutates `a` in place
     row.append(fields);
     return row;
   }
@@ -2881,9 +3341,10 @@
     if (state.menus.some((m) => m.id === id)) { err.textContent = 'Меню с таким ID уже есть.'; err.hidden = false; return; }
 
     const type = selectedNmType();
+    // legacy &-codes are the documented default notation now (&f = белый)
     const obj = type === 'inventory'
-      ? { type: 'inventory', title: '<white>' + id, items: {} }
-      : { type: 'chest', title: '<white>' + id, rows: 3, items: {} };
+      ? { type: 'inventory', title: '&f' + id, items: {} }
+      : { type: 'chest', title: '&f' + id, rows: 3, items: {} };
 
     state.menus.push({ id, obj });
     state.sel = state.menus.length - 1;

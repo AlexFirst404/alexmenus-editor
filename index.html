@@ -61,7 +61,9 @@
       <div class="center-toolbar" id="center-toolbar">
         <label class="field grow">
           <span class="lbl">Заголовок (title)</span>
-          <input type="text" id="menu-title" class="in" placeholder="&6&lМагазин  ·  &#ff5555hex  ·  <gradient:#f00:#00f>тоже" />
+          <!-- NB: the &-hex examples MUST be written as &amp;# — a bare &#55… is parsed as an HTML
+               numeric character reference and the placeholder would show garbage. -->
+          <input type="text" id="menu-title" class="in" placeholder="&6&lМагазин  ·  &amp;#ff5555hex  ·  #55ff55  ·  <gradient:#f00:#00f>тоже" />
         </label>
         <label class="field rows-field" id="rows-field">
           <span class="lbl">Рядов</span>
@@ -109,8 +111,8 @@
                 <button class="btn small" id="ms-oi-pick" type="button" title="Выбрать материал из списка">Выбрать…</button>
               </div>
               <label class="field ms-sub-full">
-                <span class="lbl">Имя (name, MiniMessage)</span>
-                <input type="text" id="ms-oi-name" class="in" placeholder="&6Меню" />
+                <span class="lbl">Имя (name) — цвета &amp;c, &amp;#RRGGBB, #RRGGBB</span>
+                <input type="text" id="ms-oi-name" class="in" placeholder="&6Меню  (или &amp;#ffaa00, #ffaa00)" />
               </label>
               <label class="field">
                 <span class="lbl">custom-model-data (cmd)</span>
@@ -223,6 +225,21 @@
         <!-- Full item editor, shown only once the active slot holds an item -->
         <div class="slot-rest" id="slot-rest">
 
+        <!-- Slot mode: a normal item/button, or an INPUT slot the player can put their own items into.
+             The mode is stored as the presence of the element's `input:` map; the editor below is
+             built by renderInputEditor() and always writes to the ACTIVE slot only (never bulk). -->
+        <div class="field slot-mode" id="f-mode-field">
+          <span class="lbl">Режим слота</span>
+          <div class="mat-row" id="f-mode-tabs">
+            <button type="button" class="btn small primary" id="f-mode-item" aria-pressed="true">Обычный предмет</button>
+            <button type="button" class="btn small" id="f-mode-input" aria-pressed="false">Слот для предметов игрока</button>
+          </div>
+          <p class="faint" id="f-mode-hint">Обычный предмет: клики выполняют действия из списка ниже.</p>
+        </div>
+
+        <!-- Input-slot editor (accept-фильтры, max-amount, lock-extract, placeholder, on-* действия) -->
+        <div class="field input-wrap" id="f-input-wrap" hidden></div>
+
         <!-- Custom player-head skin — shown only when the material is a player head. Fill one field. -->
         <div class="field head-fields" id="f-head-fields" hidden>
           <span class="lbl">Голова игрока (кастомный скин)</span>
@@ -238,13 +255,13 @@
         </label>
 
         <label class="field">
-          <span class="lbl">Имя (name, MiniMessage)</span>
-          <input type="text" id="f-name" class="in" placeholder="&aКнопка  (или &#55ff55, <green>)" />
+          <span class="lbl">Имя (name) — цвета &amp;c, &amp;#RRGGBB, #RRGGBB</span>
+          <input type="text" id="f-name" class="in" placeholder="&aКнопка  (или &amp;#55ff55, #55ff55)" />
         </label>
 
         <label class="field">
           <span class="lbl">Лор (lore, по строке на ряд)</span>
-          <textarea id="f-lore" class="in area" rows="3" placeholder="&7Первая строка&#10;&#ffaa00Вторая строка"></textarea>
+          <textarea id="f-lore" class="in area" rows="3" placeholder="&7Первая строка&#10;&amp;#ffaa00Вторая строка&#10;#55ff55Третья"></textarea>
         </label>
 
         <div class="field">
@@ -268,6 +285,7 @@
           <span class="lbl">Требования</span>
           <div class="req-group">
             <span class="req-group-lbl">Показ (view-requirement)</span>
+            <p class="faint" id="req-view-input-note" hidden>На input-слоте условие показа игнорируется плагином — скрытый слот терял бы вещи игрока.</p>
             <div id="req-view"></div>
           </div>
           <div class="req-group">
