@@ -199,10 +199,16 @@
                           <option value="none">нет</option>
                           <option value="sweep">sweep — по слотам</option>
                           <option value="rows">rows — по рядам</option>
+                          <option value="columns">columns — по столбцам</option>
                           <option value="random">random — вразнобой</option>
                           <option value="corners">corners — из четырёх углов</option>
                           <option value="edges">edges — сверху и снизу к центру</option>
                           <option value="ellipse">ellipse — эллипс из центра к краям</option>
+                          <option value="spiral">spiral — по спирали снаружи внутрь</option>
+                          <option value="center-out">center-out — кольцами от центра</option>
+                          <option value="diagonal">diagonal — по диагоналям</option>
+                          <option value="snake">snake — змейкой</option>
+                          <option value="custom">custom — свой порядок (кликами)</option>
                         </select>
                       </label>
                       <!-- Pace in percent. 1..100 = one reveal step every N ticks (100 = every tick,
@@ -218,6 +224,19 @@
                         <span class="lbl">Звук шага (sound)</span>
                         <input type="text" id="ms-oa-sound" class="in" placeholder="minecraft:ui.button.click" />
                       </label>
+                      <!-- type: custom -> `order:` builder. Shown only for custom; the grid itself is
+                           built by renderOaOrder() in app.js (it needs the menu's rows to size itself). -->
+                      <div class="field ms-sub-full oa-order" id="ms-oa-order-wrap" hidden>
+                        <span class="lbl">Порядок раскрытия (order) — кликай по ячейкам</span>
+                        <div class="oa-order-grid" id="ms-oa-order-grid"></div>
+                        <div class="oa-order-bar">
+                          <button class="btn small" id="ms-oa-order-clear" type="button">Очистить</button>
+                          <button class="btn small" id="ms-oa-order-rev" type="button">Обратный порядок</button>
+                          <span class="faint" id="ms-oa-order-sum"></span>
+                        </div>
+                        <span class="faint">Клик — добавить слот в конец очереди, повторный клик — убрать.
+                          Слоты вне списка плагин покажет последними одним кадром.</span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -401,6 +420,22 @@
                   <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
                 </label>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Анимация предмета (animation: interval/loop/frames). Built by renderItemAnimation();
+             frames INHERIT the base item, so an empty frame field means "не переопределять". -->
+        <section class="acc" data-acc="anim" data-open="false">
+          <button class="acc-head" type="button" id="acc-anim-btn"
+                  aria-expanded="false" aria-controls="acc-anim-body">
+            <span class="acc-chev" aria-hidden="true"></span>
+            <span class="acc-title">Анимация предмета (animation)</span>
+            <span class="acc-sub">кадры · интервал</span>
+          </button>
+          <div class="acc-body" id="acc-anim-body" role="region" aria-labelledby="acc-anim-btn">
+            <div class="acc-inner">
+              <div class="field anim-wrap" id="f-anim-wrap"></div>
             </div>
           </div>
         </section>

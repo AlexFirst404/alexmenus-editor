@@ -142,6 +142,13 @@
   // transient drag-select bookkeeping
   const drag = { pending: false, moved: false, startSlot: null };
 
+  // menu id -> the last custom reveal order the admin built with the open-animation click-grid.
+  // `order:` is only written to YAML for `type: custom`, so switching the type to anything else
+  // erases it from the model. Without this draft the order would survive only until the next
+  // re-render (raw toggle, menu switch, rows change) — i.e. a couple of curious clicks on the type
+  // <select> would silently destroy a hand-placed 54-slot sequence.
+  const oaOrderDrafts = new Map();
+
   // graph-view bookkeeping (node positions persist across renders so drags stick)
   const graphPos = {};         // menu/ghost id -> { x, y } center
   let graphNodes = [];         // current node list
@@ -196,7 +203,10 @@
   const current = () => (state.sel >= 0 ? state.menus[state.sel] : null);
   // Clearing the selection also leaves the full-screen requirement editor: its onChange closures are
   // bound to the previous menu/slot context, so switching menu (which resetSelection()s) must exit it.
-  function resetSelection() { state.selected = new Set(); state.active = null; state.reqEdit = false; state.reqEditCtx = null; }
+  function resetSelection() {
+    stopAnimPreview();   // the preview is anchored to a slot of the menu we are leaving
+    state.selected = new Set(); state.active = null; state.reqEdit = false; state.reqEditCtx = null;
+  }
 
   // ================================================================== INIT
   async function init() {
@@ -418,6 +428,9 @@
         if (state.active != null && state.active >= v * 9) state.active = null;
         renderGrid();
         renderProps();
+        // the open-animation `order:` click-grid is sized from rows and may now hold slots that no
+        // longer exist — rebuilding menu-settings re-sanitises it against the new grid
+        renderMenuSettings();
       };
     } else {
       rowsField.hidden = true;
@@ -500,12 +513,19 @@
       oiMat.value = mat; syncOpenItem(); setMatIconEl($('ms-oi-ic'), mat);
     });
 
-    // open-animation {type, interval, sound} — omitted when type is none/empty
+    // open-animation {type, interval|speed, sound, order} — omitted when type is none/empty
     const oa = (m.obj['open-animation'] && typeof m.obj['open-animation'] === 'object') ? m.obj['open-animation'] : {};
     const oaType = $('ms-oa-type'), oaSpeed = $('ms-oa-speed'), oaSpeedVal = $('ms-oa-speed-val'),
           oaSound = $('ms-oa-sound'), oaNote = $('ms-oa-speed-note');
     oaSpeed.max = String(OA_SPEED_MAX);   // safety net if index.html is older than this script
     oaType.value = normalizeOaType(oa.type);
+    // `order:` is only meaningful for type: custom, but a non-empty list on ANY type is what the
+    // plugin reads as "the admin meant custom" (parseOpenAnimation upgrades the type). Mirror that
+    // here so a hand-written `order:` without `type:` opens the click-grid instead of looking lost.
+    if (Array.isArray(oa.order) && oa.order.length && (oa.type == null || oaType.value === 'custom')) oaType.value = 'custom';
+    // the model wins; the draft only fills in when the model has no order to show (see oaOrderDrafts)
+    const storedOrder = sanitizeOaOrder(oa.order, slotCount(m.obj));
+    const oaOrder = storedOrder.length ? storedOrder : sanitizeOaOrder(oaOrderDrafts.get(m.id), slotCount(m.obj));
     oaSpeed.value = String(oaSpeedOf(oa));
     oaSound.value = oa.sound != null ? String(oa.sound) : '';
     // A legacy `interval` outside the representable 1..20 tick range has no exact speed value; keep it
@@ -528,22 +548,84 @@
         ? 'Выше 100% меню раскрывается пачками: ' + batch + ' ' + plural(batch, 'шаг', 'шага', 'шагов')
           + ' за тик. Нужен плагин с поддержкой пачек — более старые сборки зажмут значение до 100%.'
         : '';
+      const custom = oaType.value === 'custom';
       setAccSub('ms-anim', (oaType.value === 'none' || !oaType.value)
         ? 'выключена'
-        : oaType.value + ' · ' + (isNaN(sp) ? '—' : sp) + '%');
+        : oaType.value + ' · ' + (isNaN(sp) ? '—' : sp) + '%'
+          + (custom ? ' · ' + oaOrder.length + ' ' + plural(oaOrder.length, 'слот', 'слота', 'слотов') : ''));
     };
     const syncOpenAnim = () => {
       paintSpeed();
+      // Remember the order even while the type is not custom, so a "what does spiral look like?"
+      // detour does not throw the hand-built sequence away. «Очистить» empties it here too, so an
+      // intentionally cleared order stays cleared instead of resurrecting on the next render.
+      if (oaOrder.length) oaOrderDrafts.set(m.id, oaOrder.slice()); else oaOrderDrafts.delete(m.id);
       const t = oaType.value;
-      if (!t || t === 'none') { delete m.obj['open-animation']; return; }
+      if (!t || t === 'none') { delete m.obj['open-animation']; renderOaOrder(); return; }
       const spec = { type: t };
       const sp = parseInt(oaSpeed.value, 10);
       if (legacyUnrepresentable && sp === legacySliderValue) spec.interval = legacyIv;
       else if (!isNaN(sp)) spec.speed = Math.max(1, Math.min(OA_SPEED_MAX, sp));   // 1..200
       const snd = oaSound.value.trim(); if (snd) spec.sound = snd;
+      // `order:` travels ONLY with type: custom — on any other pattern the plugin warns and ignores
+      // it, so writing it would be config noise that shouts on every reload. The draft above is what
+      // makes dropping it non-destructive.
+      if (t === 'custom' && oaOrder.length) spec.order = oaOrder.slice();
       m.obj['open-animation'] = spec;
+      renderOaOrder();
     };
+
+    // ---- custom `order:` click-grid -------------------------------------------------------
+    // Clicking a cell appends it to the reveal queue; clicking it again removes it and renumbers
+    // everything after. Cells that hold an item show their icon, so the admin picks by sight.
+    const ordWrap = $('ms-oa-order-wrap'), ordGrid = $('ms-oa-order-grid'), ordSum = $('ms-oa-order-sum');
+    function renderOaOrder() {
+      if (!ordWrap || !ordGrid) return;
+      const custom = oaType.value === 'custom';
+      ordWrap.hidden = !custom;
+      if (!custom) { clear(ordGrid); return; }
+      const count = slotCount(m.obj);
+      const items = m.obj.items || {};
+      clear(ordGrid);
+      // a non-chest/inventory menu has no grid to click at all (it is raw-YAML-only) — say so instead
+      // of drawing an empty 0-column box the admin would read as a rendering bug
+      if (!count) {
+        ordGrid.style.gridTemplateColumns = '';
+        ordGrid.append(el('span', 'faint', 'У этого типа меню нет сетки слотов — задайте order в «Сыром YAML».'));
+        if (ordSum) ordSum.textContent = '';
+        return;
+      }
+      ordGrid.style.gridTemplateColumns = 'repeat(' + Math.min(9, count) + ', var(--oa-cell))';
+      for (let s = 0; s < count; s++) {
+        const idx = oaOrder.indexOf(s);
+        const c = el('button', 'oa-cell' + (idx >= 0 ? ' on' : ''));
+        c.type = 'button';
+        c.title = 'Слот ' + s + (idx >= 0 ? ' — шаг ' + (idx + 1) : ' — не в списке');
+        const it = items[String(s)];
+        if (it) c.append(makeItemIconHolder(it, 22, 'oa-cell-txt', false));
+        c.append(el('span', 'oa-cell-num', idx >= 0 ? String(idx + 1) : String(s)));
+        c.onclick = () => {
+          const at = oaOrder.indexOf(s);
+          if (at >= 0) oaOrder.splice(at, 1); else oaOrder.push(s);
+          syncOpenAnim();
+        };
+        ordGrid.append(c);
+      }
+      if (ordSum) {
+        const rest = count - oaOrder.length;
+        ordSum.textContent = oaOrder.length
+          ? oaOrder.length + ' из ' + count + (rest ? ' · остальные ' + rest + ' — последним кадром' : ' · весь порядок задан')
+          : 'пусто — плагин предупредит и откатится на sweep';
+      }
+    }
+    const ordClear = $('ms-oa-order-clear'), ordRev = $('ms-oa-order-rev');
+    if (ordClear) ordClear.onclick = () => { oaOrder.length = 0; syncOpenAnim(); };
+    if (ordRev) ordRev.onclick = () => { oaOrder.reverse(); syncOpenAnim(); };
+
     paintSpeed();
+    renderOaOrder();
+    // The type <select> is the only control that can bring `order:` in or out of the spec, so it
+    // must re-serialise even when nothing else changed (e.g. rows -> custom with a saved order).
     oaType.onchange = syncOpenAnim;
     oaSpeed.oninput = syncOpenAnim;
     oaSound.oninput = syncOpenAnim;
@@ -578,7 +660,7 @@
     grid.style.display = 'grid';
     hint.textContent = 'ЛКМ — выбрать · Ctrl — добавить · Shift — диапазон · тянуть — рамкой · ПКМ — меню';
 
-    const count = type === 'inventory' ? 27 : rowsOf(m.obj) * 9;
+    const count = slotCount(m.obj);
     const items = m.obj.items || {};
     resetIconObserver(); // new lazy-icon observer for this grid generation
     for (let s = 0; s < count; s++) grid.append(buildCell(items[String(s)], s));
@@ -595,6 +677,10 @@
       cell.append(makeItemIconHolder(item, 58, 'cell-txt', true));
     }
     if (isInputItem(item)) markInputCell(cell);
+    if (isAnimatedItem(item)) markAnimatedCell(cell, item);
+    // a regrid mid-preview (any edit that changes the filled set) rebuilds this cell from scratch —
+    // re-apply the "playing" tint so the ticker's next paint lands on a correctly styled cell
+    if (animPreview.slot === slot) cell.classList.add('anim-playing');
     if (state.selected.has(slot)) cell.classList.add('selected');
     if (state.active === slot) cell.classList.add('active');
     cell.addEventListener('mousedown', (e) => onCellMouseDown(e, slot));
@@ -611,6 +697,20 @@
     cell.classList.add('input-slot');
     cell.title = 'Input-слот: игрок кладёт сюда свои вещи';
     cell.append(el('span', 'cell-input-badge', '⇩'));
+  }
+  // an element is ANIMATED once it carries an `animation:` map with at least one frame
+  function isAnimatedItem(it) {
+    return !!(it && typeof it === 'object' && it.animation && typeof it.animation === 'object'
+              && Array.isArray(it.animation.frames) && it.animation.frames.length > 0);
+  }
+  // Visual marker for an animated slot, built to markInputCell's rules: a corner badge plus an
+  // ::after underline, and nothing that touches .cell's own box-shadow (that belongs to the
+  // .selected / .active rings). The badge takes the opposite corner from the input one.
+  function markAnimatedCell(cell, item) {
+    cell.classList.add('anim-slot');
+    const n = item.animation.frames.length;
+    cell.title = 'Анимированный предмет: ' + n + ' ' + plural(n, 'кадр', 'кадра', 'кадров');
+    cell.append(el('span', 'cell-anim-badge', '▶'));
   }
 
   // ---------- selection interactions ----------
@@ -700,6 +800,9 @@
     const m = current();
     const empty = $('slot-empty');
     const body = $('slot-editor');
+    // The frame preview belongs to ONE slot's cell and its ▶/■ button lives in this panel, so it can
+    // never outlive the slot that started it — switching slots (or clearing the selection) stops it.
+    if (animPreview.slot != null && animPreview.slot !== state.active) stopAnimPreview();
     if (!m || state.active == null) { empty.hidden = false; body.hidden = true; return; }
 
     const real = (m.obj.items && m.obj.items[String(state.active)]) || null;
@@ -747,6 +850,7 @@
     }, false);
 
     renderSlotMode(disp);           // обычный предмет / input-слот (+ the input editor)
+    renderItemAnimation();          // animation: interval/loop/frames (+ the in-grid preview)
     renderHeadFields(disp);
     renderFlags(disp);
     renderClicks(disp);
@@ -1436,16 +1540,37 @@
     if (val == null || String(val).trim() === '') delete obj[key];
     else obj[key] = val;
   }
-  // map a stored open-animation type (incl. plugin aliases) onto a <select> option value
+  // map a stored open-animation type (incl. plugin aliases) onto a <select> option value.
+  // Alias table mirrors OpenAnimation.Type.fromConfig() 1:1 — note that `center` deliberately stays
+  // on ELLIPSE (it predates center-out; remapping it would silently reshape old configs).
   function normalizeOaType(raw) {
     const s = String(raw == null ? '' : raw).trim().toLowerCase();
     if (s === 'sweep' || s === 'slots' || s === 'slot') return 'sweep';
     if (s === 'rows' || s === 'row') return 'rows';
+    if (s === 'columns' || s === 'column' || s === 'cols' || s === 'col') return 'columns';
     if (s === 'random' || s === 'shuffle') return 'random';
     if (s === 'corners' || s === 'corner') return 'corners';
     if (s === 'edges' || s === 'converge' || s === 'top_bottom' || s === 'top-bottom') return 'edges';
     if (s === 'ellipse' || s === 'oval' || s === 'ripple' || s === 'center') return 'ellipse';
+    if (s === 'spiral') return 'spiral';
+    if (s === 'center-out' || s === 'center_out' || s === 'centerout' || s === 'outward' || s === 'explode') return 'center-out';
+    if (s === 'diagonal' || s === 'diag') return 'diagonal';
+    if (s === 'snake' || s === 'zigzag' || s === 'boustrophedon') return 'snake';
+    if (s === 'custom' || s === 'order' || s === 'manual') return 'custom';
     return 'none';
+  }
+  // Sanitise a stored `order:` list the way MenuStore.parseOrder does — drop non-numbers, slots
+  // outside the grid and repeats — so the click-grid can never show a state the plugin would reject.
+  function sanitizeOaOrder(raw, count) {
+    if (!Array.isArray(raw)) return [];
+    const seen = new Set(), out = [];
+    raw.forEach((v) => {
+      const n = parseInt(v, 10);
+      if (isNaN(n) || n < 0 || n >= count || seen.has(n)) return;
+      seen.add(n);
+      out.push(n);
+    });
+    return out;
   }
   // stored open-animation pace -> a 1..OA_SPEED_MAX slider value (legacy `interval` ticks are converted)
   function oaSpeedOf(oa) {
@@ -1459,6 +1584,390 @@
       if (!isNaN(iv)) return Math.max(1, Math.min(100, 100 - (iv - 1) * 5));
     }
     return 95;   // ≈2 ticks/step — matches the pre-speed default instead of the much slower slider midpoint
+  }
+
+  // ================================================================== ITEM ANIMATION (element key `animation:`)
+  // `animation: { interval, loop, frames: [ …overrides… ] }`. A frame carries ONLY the keys it
+  // overrides — everything else is inherited from the base item, and `- {}` is literally "the base
+  // item". That inheritance is why every field below goes through setOrDel: an empty box must leave
+  // the key OUT of the frame (inherit), not write an empty string that would blank the base value.
+  //
+  // Like the input editor, all writes target the ACTIVE slot only. Bulk-applying a frame list to a
+  // mixed selection is meaningless — frames inherit from the base item, so the same frames on two
+  // different items produce two different animations, which is never what a marquee-select meant.
+  const ANIM_LOOPS = [['loop', 'Зациклить'], ['once', 'Один раз'], ['pingpong', 'Туда-обратно']];
+  const ANIM_DEFAULT_INTERVAL = 10;   // ItemAnimation's own default when `interval:` is absent
+
+  // The plugin's loop aliases, mirrored 1:1 from ItemAnimation.Loop.fromConfig. Kept as data so the two
+  // lists can be eyeballed side by side: a missing alias here silently rewrites the admin's mode on the
+  // next apply (the editor shows «Зациклить», they click it, and `loop: pingpong` becomes `loop: true`).
+  // 'false' is in the once-list on purpose — quoted in YAML it arrives as the STRING "false".
+  const ANIM_LOOP_ALIASES = {
+    once: ['false', 'no', 'once', 'stop', 'hold'],
+    pingpong: ['pingpong', 'ping-pong', 'ping_pong', 'bounce', 'yoyo', 'alternate'],
+  };
+
+  // normalise the plugin's loop aliases (incl. the YAML booleans) onto our three option values
+  function animLoopOf(raw) {
+    if (raw === true) return 'loop';
+    if (raw === false) return 'once';
+    const s = String(raw == null ? '' : raw).trim().toLowerCase();
+    if (ANIM_LOOP_ALIASES.once.includes(s)) return 'once';
+    if (ANIM_LOOP_ALIASES.pingpong.includes(s)) return 'pingpong';
+    return 'loop';   // true / LOOP / anything unknown — same fallback the engine uses
+  }
+  // the value we WRITE back for each option (`loop: true` is the engine default but is written
+  // anyway: the key is the one thing an admin re-reading the YAML looks for, and it costs one line)
+  function animLoopValue(id) { return id === 'once' ? false : (id === 'pingpong' ? 'pingpong' : true); }
+
+  // frame keys the plugin merges over the base item (ItemSpec.merge). The editor only exposes four
+  // of them, but the list drives the PREVIEW merge, so a hand-written `flags:` frame still previews.
+  const FRAME_KEYS = ['material', 'cmd', 'name', 'lore', 'flags', 'hide-all', 'head-owner', 'head-uuid', 'head-texture'];
+  // base item + one frame's overrides -> the item this frame actually shows. Key PRESENCE decides
+  // (not truthiness), which is what makes `lore: []` a real "clear the lore" instead of "inherit".
+  function mergeFrame(base, frame) {
+    const out = {};
+    Object.keys(base || {}).forEach((k) => { if (k !== 'animation') out[k] = base[k]; });
+    if (frame && typeof frame === 'object') {
+      FRAME_KEYS.forEach((k) => { if (Object.prototype.hasOwnProperty.call(frame, k)) out[k] = frame[k]; });
+    }
+    return out;
+  }
+
+  // ---- preview: cycle the frames straight in the grid cell -------------------------------------
+  // One preview at a time, keyed by slot. The ticker re-reads the element from the model on every
+  // frame, so edits made while it runs show up immediately and a deleted animation stops it by
+  // itself — no listener to unsubscribe and no stale copy of the frame list to go out of date.
+  const animPreview = { slot: null, timer: null, i: 0, dir: 1, held: false };
+
+  function animPreviewCell(slot) {
+    const grid = $('slot-grid');
+    return grid ? grid.querySelector('.cell[data-slot="' + slot + '"]') : null;
+  }
+  // paint `item` into a cell's icon holder, replacing whatever is there (icon holders are cheap and
+  // self-contained: .cell-num / the badges are siblings, so they survive untouched)
+  function paintCellItem(slot, item) {
+    const cell = animPreviewCell(slot);
+    if (!cell) return false;
+    const holder = makeItemIconHolder(item, 58, 'cell-txt', false);
+    const old = cell.querySelector('.ic-holder');
+    if (old) cell.replaceChild(holder, old); else cell.append(holder);
+    return true;
+  }
+  function stopAnimPreview() {
+    if (animPreview.timer) clearInterval(animPreview.timer);
+    const was = animPreview.slot;
+    animPreview.timer = null; animPreview.slot = null; animPreview.i = 0; animPreview.dir = 1;
+    animPreview.held = false;
+    if (was != null) {
+      const m = current();
+      const it = (m && m.obj.items) ? m.obj.items[String(was)] : null;
+      if (it) paintCellItem(was, it);        // restore the base item under the cursor
+      const cell = animPreviewCell(was);
+      if (cell) cell.classList.remove('anim-playing');
+    }
+    const btn = $('f-anim-play');
+    if (btn) { btn.textContent = '▶ Проиграть'; btn.classList.remove('primary'); }
+  }
+  // `loop: false` reaches its last frame and HOLDS it — the cell keeps showing that frame (which is
+  // exactly what the player would see in game), but the preview is no longer running, so the button
+  // has to offer a replay instead of a stop and the pulsing "playing" tint has to go.
+  function finishAnimPreview() {
+    if (animPreview.timer) clearInterval(animPreview.timer);
+    animPreview.timer = null;
+    animPreview.held = true;
+    const cell = animPreviewCell(animPreview.slot);
+    if (cell) cell.classList.remove('anim-playing');
+    const btn = $('f-anim-play');
+    if (btn) { btn.textContent = '▶ Заново'; btn.classList.remove('primary'); }
+  }
+  function toggleAnimPreview(slot) {
+    // a HELD preview is finished, not running: clicking «Заново» must replay it, not stop it
+    if (animPreview.slot === slot && !animPreview.held) { stopAnimPreview(); return; }
+    stopAnimPreview();
+    const m = current();
+    const it = (m && m.obj.items) ? m.obj.items[String(slot)] : null;
+    if (!isAnimatedItem(it)) { toast('Сначала добавьте кадры', 'err'); return; }
+    animPreview.slot = slot; animPreview.i = 0; animPreview.dir = 1; animPreview.held = false;
+    const cell = animPreviewCell(slot);
+    if (cell) cell.classList.add('anim-playing');
+    const btn = $('f-anim-play');
+    if (btn) { btn.textContent = '■ Стоп'; btn.classList.add('primary'); }
+    // 1 tick = 50 ms. The floor is one tick, same as the engine's clamp, so the preview can never
+    // spin faster than the server would — an admin timing an animation here sees the real pace.
+    const iv = Math.max(1, parseInt(it.animation.interval, 10) || ANIM_DEFAULT_INTERVAL);
+    const step = () => {
+      const cur = current();
+      const live = (cur && cur.obj.items) ? cur.obj.items[String(slot)] : null;
+      if (!isAnimatedItem(live)) { stopAnimPreview(); return; }      // animation deleted mid-play
+      const frames = live.animation.frames;
+      const n = frames.length;
+      if (animPreview.i >= n) animPreview.i = n - 1;                  // frames removed mid-play
+      if (!paintCellItem(slot, mergeFrame(live, frames[animPreview.i]))) { stopAnimPreview(); return; }
+      const mode = animLoopOf(live.animation.loop);
+      if (n < 2) { finishAnimPreview(); return; }   // one frame: nothing to cycle, so hold it
+      if (mode === 'once') {
+        if (animPreview.i >= n - 1) { finishAnimPreview(); return; }
+        animPreview.i++;
+      } else if (mode === 'pingpong') {
+        // period 2n-2: the endpoints are visited ONCE per pass, matching ItemAnimation's frameAt()
+        if (animPreview.i + animPreview.dir >= n || animPreview.i + animPreview.dir < 0) animPreview.dir *= -1;
+        animPreview.i += animPreview.dir;
+      } else {
+        animPreview.i = (animPreview.i + 1) % n;
+      }
+    };
+    step();                                   // show frame 0 immediately, don't wait a full interval
+    if (animPreview.timer == null && animPreview.slot === slot) animPreview.timer = setInterval(step, iv * 50);
+  }
+
+  // ---- the editor ------------------------------------------------------------------------------
+  function renderItemAnimation() {
+    const host = $('f-anim-wrap');
+    if (!host) return;
+    clear(host);
+    const m = current();
+    const it = activeItemObj();
+    if (!m || !it) { setAccSub('anim', 'нет'); return; }
+
+    // Parser rules that make `animation:` illegal on this element. The plugin throws the animation
+    // away with a warning in both cases, so refuse to author one instead of writing dead YAML.
+    const blocked = isInputItem(it)
+      ? 'На input-слоте анимация запрещена: покадровый перерендер спорит с вещами игрока, плагин её отбросит.'
+      : ((m.obj.type || 'chest') === 'inventory'
+        ? 'Тип меню «inventory» не поддерживает анимацию предметов — плагин её отбросит.'
+        : null);
+    if (blocked) {
+      stopAnimPreviewFor(state.active);
+      const warn = el('div', 'input-warn');
+      warn.append(el('span', null, '⚠ ' + blocked));
+      host.append(warn);
+      if (it.animation != null) {          // an imported/hand-written key that can never run: offer to drop it
+        const drop = el('button', 'btn small danger-ghost', 'Удалить animation');
+        drop.type = 'button';
+        drop.onclick = () => { delete it.animation; renderGrid(); renderProps(); };
+        host.append(drop);
+      }
+      setAccSub('anim', 'недоступна');
+      return;
+    }
+
+    const anim = (it.animation && typeof it.animation === 'object') ? it.animation : null;
+    const frames = (anim && Array.isArray(anim.frames)) ? anim.frames : [];
+    // The whole key exists only while there is at least one frame; commit() is the single writer.
+    const commit = (regrid) => {
+      if (!frames.length) delete it.animation;
+      else {
+        const spec = it.animation && typeof it.animation === 'object' ? it.animation : {};
+        spec.frames = frames;
+        it.animation = spec;
+      }
+      if (regrid) renderGrid();
+    };
+
+    if (!frames.length) {
+      const hint = el('p', 'faint',
+        'Кадры наследуют базовый предмет: в кадре задаются только те поля, что меняются. '
+        + 'Пустой кадр = базовый предмет. Ключ animation: появится в YAML только когда есть кадры.');
+      host.append(hint);
+      const add = el('button', 'btn small add-action', '＋ кадр');
+      add.type = 'button';
+      add.onclick = () => {
+        it.animation = { interval: ANIM_DEFAULT_INTERVAL, loop: true, frames: [{}, {}] };
+        renderGrid(); renderProps();
+      };
+      host.append(add);
+      setAccSub('anim', 'нет');
+      return;
+    }
+
+    // ---- interval + loop ----
+    // An EMPTY box DROPS the key instead of pinning it to 10: absent and 10 mean exactly the same
+    // thing to the engine, and the placeholder already spells the default out.
+    const ivField = pctField('Интервал (тиков на кадр)', anim.interval,
+      (v) => {
+        if (v == null) delete it.animation.interval;
+        else it.animation.interval = Math.max(1, Math.round(v));
+        restartPreviewIfPlaying();
+      },
+      { min: 1, max: 200, step: 1, placeholder: String(ANIM_DEFAULT_INTERVAL) });
+    host.append(ivField);
+
+    const loopId = animLoopOf(anim.loop);
+    const loopRow = el('div', 'mat-row anim-loop');
+    ANIM_LOOPS.forEach(([id, label]) => {
+      const b = el('button', 'btn small' + (id === loopId ? ' primary' : ''), label);
+      b.type = 'button';
+      b.setAttribute('aria-pressed', id === loopId ? 'true' : 'false');
+      b.onclick = () => { it.animation.loop = animLoopValue(id); renderItemAnimation(); restartPreviewIfPlaying(); };
+      loopRow.append(b);
+    });
+    host.append(fieldWrap('Повтор (loop)', loopRow));
+
+    // ---- preview ----
+    const bar = el('div', 'mat-row anim-bar');
+    // three states, matching stop/finish above: running here, finished-and-held here, or not ours
+    const mine = animPreview.slot === state.active;
+    const running = mine && !animPreview.held;
+    const play = el('button', 'btn small' + (running ? ' primary' : ''),
+      running ? '■ Стоп' : (mine ? '▶ Заново' : '▶ Проиграть'));
+    play.type = 'button'; play.id = 'f-anim-play';
+    play.title = 'Прокрутить кадры прямо в ячейке сетки';
+    const slotAtBind = state.active;
+    play.onclick = () => toggleAnimPreview(slotAtBind);
+    bar.append(play, el('span', 'faint', 'кадры крутятся в ячейке слота ' + state.active));
+    host.append(bar);
+
+    if (frames.length < 2) {
+      const warn = el('div', 'input-warn');
+      warn.append(el('span', null, '⚠ Плагину нужно минимум 2 кадра — с одним кадром animation: будет отброшена при загрузке.'));
+      host.append(warn);
+    }
+
+    // ---- frames ----
+    host.append(el('span', 'req-sub-lbl', 'Кадры (frames) — пустое поле = наследовать у базового предмета'));
+    const list = el('div', 'anim-frames');
+    host.append(list);
+    frames.forEach((f, i) => list.append(buildFrameRow(it, frames, i, commit)));
+
+    const add = el('button', 'btn small add-action', '＋ кадр');
+    add.type = 'button';
+    add.onclick = () => { frames.push({}); commit(true); renderItemAnimation(); };
+    host.append(add);
+
+    setAccSub('anim', frames.length + ' ' + plural(frames.length, 'кадр', 'кадра', 'кадров')
+      + ' · ' + (anim.interval != null ? anim.interval : ANIM_DEFAULT_INTERVAL) + ' тик.'
+      + ' · ' + (ANIM_LOOPS.find(([id]) => id === loopId) || [, ''])[1].toLowerCase());
+    numChrome(host);
+  }
+
+  // stop the preview when it is running on `slot` (used when a slot stops being animatable)
+  function stopAnimPreviewFor(slot) { if (animPreview.slot != null && animPreview.slot === slot) stopAnimPreview(); }
+  // interval/loop changed under a running preview -> restart it so the new pacing takes effect
+  function restartPreviewIfPlaying() {
+    const s = animPreview.slot;
+    if (s == null) return;
+    stopAnimPreview();
+    toggleAnimPreview(s);
+  }
+
+  function buildFrameRow(it, frames, idx, commit) {
+    if (!frames[idx] || typeof frames[idx] !== 'object') frames[idx] = {};
+    const f = frames[idx];
+    const row = el('div', 'action-row anim-frame');
+
+    const top = el('div', 'action-top');
+    const ic = el('span', 'mat-ic');
+    setMatIconEl(ic, f.material != null && String(f.material).trim() ? f.material : it.material);
+    top.append(ic, el('span', 'ck-name', 'Кадр ' + (idx + 1)
+      + (Object.keys(f).length ? '' : ' — базовый предмет')));
+
+    const up = el('button', 'btn icon', '↑'); up.type = 'button'; up.title = 'Выше';
+    up.disabled = idx === 0;
+    up.onclick = () => { frames.splice(idx - 1, 0, frames.splice(idx, 1)[0]); commit(true); renderItemAnimation(); };
+    const down = el('button', 'btn icon', '↓'); down.type = 'button'; down.title = 'Ниже';
+    down.disabled = idx === frames.length - 1;
+    down.onclick = () => { frames.splice(idx + 1, 0, frames.splice(idx, 1)[0]); commit(true); renderItemAnimation(); };
+    const del = el('button', 'btn icon', '×'); del.type = 'button'; del.title = 'Удалить кадр';
+    del.onclick = () => {
+      frames.splice(idx, 1);
+      if (!frames.length) stopAnimPreviewFor(state.active);
+      commit(true);
+      renderItemAnimation();
+    };
+    top.append(up, down, del);
+    row.append(top);
+
+    const fields = el('div', 'action-fields');
+
+    // material — empty inherits the base material (the icon above follows suit)
+    const mat = document.createElement('input');
+    mat.type = 'text'; mat.className = 'in';
+    mat.placeholder = 'как у базового (' + String(it.material || '—') + ')';
+    mat.value = f.material != null ? String(f.material) : '';
+    // commit(false): a frame's material never changes what the GRID shows (the cell paints the base
+    // item, and the ▶ badge counts frames), so there is nothing to regrid on every keystroke here.
+    const syncMat = () => {
+      setOrDel(f, 'material', mat.value.trim());
+      setMatIconEl(ic, mat.value.trim() || it.material);
+      commit(false);
+    };
+    mat.oninput = syncMat;
+    const pick = el('button', 'btn small', 'Выбрать…');
+    pick.type = 'button';
+    pick.onclick = () => openMaterialPickerFor((mm) => { mat.value = mm; syncMat(); });
+    const matRow = el('div', 'mat-row');
+    matRow.append(mat, pick);
+    fields.append(labelWrap('Материал (material)', matRow));
+
+    // name / lore are TRI-state: absent = inherit, "" / [] = explicitly blank, value = override.
+    // The «убрать» toggle is the only way to express the middle state — an empty text box has to
+    // keep meaning "inherit", or a frame could never leave the base name alone.
+    fields.append(overrideTextField('Имя (name)', f, 'name', '', it.name, 'убрать имя', commit));
+    fields.append(overrideLoreField(f, it, commit));
+    fields.append(textField('custom-model-data (cmd)', f.cmd, (v) => { setOrDel(f, 'cmd', v); commit(false); }));
+
+    row.append(fields);
+    return row;
+  }
+
+  // text field + an «убрать» checkbox: unchecked & empty -> key absent (inherit); unchecked & typed
+  // -> key = text; checked -> key = `blank` (an empty string, i.e. "no custom name on this frame").
+  function overrideTextField(label, f, key, blank, inheritedFrom, clearLabel, commit) {
+    const wrap = el('div', 'field anim-ov');
+    const head = el('div', 'anim-ov-head');
+    head.append(el('span', 'lbl', label));
+    const cleared = f[key] === blank;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = cleared;
+    const cbLab = el('label', 'check tiny');
+    cbLab.append(cb, el('span', null, clearLabel));
+    head.append(cbLab);
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'in';
+    inp.placeholder = inheritedFrom != null && String(inheritedFrom) !== ''
+      ? 'как у базового (' + String(inheritedFrom) + ')' : 'как у базового';
+    inp.value = (f[key] != null && f[key] !== blank) ? String(f[key]) : '';
+    inp.disabled = cleared;
+    inp.oninput = () => { setOrDel(f, key, inp.value); commit(false); };
+    cb.onchange = () => {
+      if (cb.checked) { f[key] = blank; inp.value = ''; inp.disabled = true; }
+      else { delete f[key]; inp.disabled = false; }
+      commit(false);
+    };
+    wrap.append(head, inp);
+    return wrap;
+  }
+  // same tri-state for lore, where the "explicitly blank" value is an EMPTY LIST. `lore: []` is the
+  // documented way to strip inherited lore in a frame, and it is only distinguishable from "absent"
+  // because the plugin reads frames off the raw map — so the editor has to keep the two apart too.
+  function overrideLoreField(f, it, commit) {
+    const wrap = el('div', 'field anim-ov');
+    const head = el('div', 'anim-ov-head');
+    head.append(el('span', 'lbl', 'Лор (lore, по строке на ряд)'));
+    const cleared = Array.isArray(f.lore) && f.lore.length === 0;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = cleared;
+    const cbLab = el('label', 'check tiny');
+    cbLab.append(cb, el('span', null, 'убрать лор'));
+    head.append(cbLab);
+    const ta = document.createElement('textarea');
+    ta.className = 'in area'; ta.rows = 2; ta.spellcheck = false;
+    const baseLore = Array.isArray(it.lore) ? it.lore.join(' / ') : (it.lore != null ? String(it.lore) : '');
+    ta.placeholder = baseLore ? 'как у базового (' + baseLore.slice(0, 40) + ')' : 'как у базового';
+    ta.value = (Array.isArray(f.lore) && f.lore.length) ? f.lore.join('\n') : '';
+    ta.disabled = cleared;
+    ta.oninput = () => {
+      if (ta.value.trim() === '') delete f.lore; else f.lore = ta.value.split('\n');
+      commit(false);
+    };
+    cb.onchange = () => {
+      if (cb.checked) { f.lore = []; ta.value = ''; ta.disabled = true; }
+      else { delete f.lore; ta.disabled = false; }
+      commit(false);
+    };
+    wrap.append(head, ta);
+    return wrap;
   }
 
   // ================================================================== BULK-EDIT helpers
@@ -3104,6 +3613,9 @@
   // raw and graph are mutually exclusive; both replace the center+right area.
   function syncModes() {
     const layout = $('layout');
+    // raw / graph / full-screen-requirement all replace the center area, taking the grid (and with it
+    // the cell the preview paints into) off screen — stop it rather than let it tick against nothing
+    if (state.raw || state.graph || state.reqEdit) stopAnimPreview();
     $('raw-toggle').setAttribute('aria-pressed', state.raw ? 'true' : 'false');
     $('graph-toggle').setAttribute('aria-pressed', state.graph ? 'true' : 'false');
     layout.classList.toggle('raw-mode', state.raw);
@@ -3833,6 +4345,14 @@
     let r = parseInt(obj && obj.rows, 10);
     if (isNaN(r)) r = 3;
     return Math.max(1, Math.min(6, r));
+  }
+  // how many slots the menu's grid has: chest = rows*9, inventory = a fixed 27. Anything else has no
+  // grid at all (edited as raw YAML), and 0 keeps every grid-builder loop empty instead of guessing.
+  function slotCount(obj) {
+    const type = (obj && obj.type) || 'chest';
+    if (type === 'inventory') return 27;
+    if (type !== 'chest') return 0;
+    return rowsOf(obj) * 9;
   }
   // number of grid cells for the current menu (0 for non-grid types)
   function gridCount() {
