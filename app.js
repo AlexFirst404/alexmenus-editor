@@ -1254,8 +1254,11 @@
 
     if (t === 'run_command') {
       box.append(textField('Команда (без /)', a.command, (v) => { a.command = v; }));
+      // `op` = от имени игрока, но с правами оператора. Вариант обязан быть в списке: без него
+      // <select> не показывал бы уже сохранённое `as: op`, и админ не увидел бы, где раздаётся оп.
       box.append(selectField('От имени', a.as || 'player',
-        [['player', 'игрок'], ['console', 'консоль']], (v) => { a.as = v; }));
+        [['player', 'игрок'], ['console', 'консоль'], ['op', 'игрок с правами оператора']],
+        (v) => { a.as = v; }));
     } else if (t === 'message' || t === 'broadcast') {
       box.append(textField('Текст (цвета &c, &#RRGGBB, #RRGGBB)', a.text, (v) => { a.text = v; }));
     } else if (t === 'actionbar') {
