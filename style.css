@@ -221,6 +221,17 @@ input[type="number"] { -moz-appearance:textfield; appearance:textfield; }
   background:var(--accent); box-shadow:0 0 8px var(--accent-soft);
   flex:0 0 auto;
 }
+/* Логотип — пиксель-арт 16x16. Размер держим КРАТНЫМ 16 (16/32/48…): на дробном масштабе часть
+   пикселей вышла бы шире соседних и сетка поехала бы. pixelated отключает сглаживание — без него
+   браузер размывает такую графику при любом увеличении и на HiDPI-экранах. */
+.brand .mark {
+  width:16px; height:16px; flex:0 0 auto; display:block;
+  /* Порядок важен: побеждает ПОСЛЕДНЕЕ объявление, которое браузер понял. crisp-edges идёт первым
+     как запасной для старых сборок Firefox, pixelated — вторым, потому что он реализован
+     предсказуемее и должен выигрывать везде, где поддерживается. */
+  image-rendering:crisp-edges;
+  image-rendering:pixelated;
+}
 .wordmark { font-weight:700; letter-spacing:.2px; }
 .brand .sep { color:var(--faint); }
 .cur-menu {
@@ -944,6 +955,7 @@ select.in { appearance:none;
 }
 .brand.big { gap:var(--sp-3); margin-bottom:var(--sp-4); }
 .brand.big .dot { width:12px; height:12px; }
+.brand.big .mark { width:32px; height:32px; }   /* x2 — снова целое кратное 16 */
 .brand.big .wordmark { font-size:20px; }
 .es-card h1 { font-size:18px; margin:0 0 var(--sp-2); font-weight:600; }
 .es-card p { margin:0 0 var(--sp-4); }

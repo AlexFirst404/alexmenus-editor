@@ -4,6 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AlexMenus — редактор меню</title>
+  <!-- Пиксель-арт 16x16. SVG первым: он собран из прямоугольников с shape-rendering: crispEdges,
+       поэтому резкий на любом DPI. PNG 32x32 (ровно x2, без промежуточных оттенков) — запасной. -->
+  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/logo-32.png" />
+  <link rel="apple-touch-icon" href="assets/logo-128.png" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -30,7 +35,7 @@
   <!-- ===================== TOP BAR ===================== -->
   <header class="topbar" id="topbar" hidden>
     <div class="brand">
-      <span class="dot" aria-hidden="true"></span>
+      <img class="mark" src="assets/logo.svg" alt="" aria-hidden="true" />
       <span class="wordmark">AlexMenus</span>
       <span class="sep" aria-hidden="true">/</span>
       <span class="cur-menu" id="cur-menu-id">—</span>
@@ -509,7 +514,7 @@
   <section class="empty-state" id="empty-state" hidden>
     <div class="es-card">
       <div class="brand big">
-        <span class="dot" aria-hidden="true"></span>
+        <img class="mark" src="assets/logo.svg" alt="" aria-hidden="true" />
         <span class="wordmark">AlexMenus</span>
       </div>
       <h1>Редактор меню</h1>
