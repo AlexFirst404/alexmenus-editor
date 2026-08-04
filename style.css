@@ -221,17 +221,6 @@ input[type="number"] { -moz-appearance:textfield; appearance:textfield; }
   background:var(--accent); box-shadow:0 0 8px var(--accent-soft);
   flex:0 0 auto;
 }
-/* Логотип — пиксель-арт 16x16. Размер держим КРАТНЫМ 16 (16/32/48…): на дробном масштабе часть
-   пикселей вышла бы шире соседних и сетка поехала бы. pixelated отключает сглаживание — без него
-   браузер размывает такую графику при любом увеличении и на HiDPI-экранах. */
-.brand .mark {
-  width:16px; height:16px; flex:0 0 auto; display:block;
-  /* Порядок важен: побеждает ПОСЛЕДНЕЕ объявление, которое браузер понял. crisp-edges идёт первым
-     как запасной для старых сборок Firefox, pixelated — вторым, потому что он реализован
-     предсказуемее и должен выигрывать везде, где поддерживается. */
-  image-rendering:crisp-edges;
-  image-rendering:pixelated;
-}
 .wordmark { font-weight:700; letter-spacing:.2px; }
 .brand .sep { color:var(--faint); }
 .cur-menu {
@@ -363,7 +352,11 @@ body.is-resizing * { cursor:col-resize !important; }
 
 /* flex:1 0 auto + no shrink: the grid keeps its intrinsic height and .center-scroll takes over
    vertical scrolling; only sideways overflow is handled locally. */
+/* position:relative so #bg-schema can be laid over the grid in the wrap's coordinate space —
+   the schema is wider and taller than .slot-grid itself (it draws the whole 176px window, and the
+   17px strip above the first slot row), so anchoring it to the grid would clip it. */
 .grid-wrap {
+  position:relative;
   flex:1 0 auto; overflow:auto;
   padding:var(--sp-6) var(--sp-5);
   display:flex; flex-direction:column;
@@ -955,7 +948,6 @@ select.in { appearance:none;
 }
 .brand.big { gap:var(--sp-3); margin-bottom:var(--sp-4); }
 .brand.big .dot { width:12px; height:12px; }
-.brand.big .mark { width:32px; height:32px; }   /* x2 — снова целое кратное 16 */
 .brand.big .wordmark { font-size:20px; }
 .es-card h1 { font-size:18px; margin:0 0 var(--sp-2); font-weight:600; }
 .es-card p { margin:0 0 var(--sp-4); }
@@ -1053,6 +1045,147 @@ select.in { appearance:none;
 .mp-cell:hover { border-color:var(--accent); background:var(--accent-soft); }
 .mp-cell:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .mp-name { font-size:10.5px; line-height:1.15; color:var(--muted); word-break:break-word; }
+
+/* ============ bundle-size meter (topbar) ============ */
+/* Menus + every freshly uploaded PNG share ONE 2 MB body. The meter is the only thing standing
+   between the admin and a 413 after an hour of work, so it lives in the topbar, next to the two
+   buttons it disables. Colours: normal -> muted, .warn (>70%) -> accent, .over -> danger. */
+.size-meter { display:flex; align-items:center; gap:var(--sp-2); min-width:0; }
+.size-bar {
+  width:76px; height:6px; flex:0 0 auto;
+  background:var(--border-2); border-radius:999px; overflow:hidden;
+}
+.size-bar > i { display:block; height:100%; width:0; background:var(--muted); transition:width .18s ease; }
+.size-txt { font-size:11.5px; color:var(--muted); font-family:var(--mono); white-space:nowrap; }
+.size-meter.warn .size-bar > i { background:var(--accent); }
+.size-meter.warn .size-txt { color:var(--accent); }
+.size-meter.over .size-bar > i { background:var(--danger); }
+.size-meter.over .size-txt { color:var(--danger); }
+
+/* ============ textures: slot field + picker/uploader ============ */
+/* preview chip beside the `texture:` input — same box as .mat-ic, but always a flat pixel image */
+.tex-ic {
+  width:30px; height:30px; flex:0 0 auto;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--panel-2); border:1px solid var(--border); border-radius:var(--r-xs);
+  overflow:hidden;
+}
+.tex-ic img { width:26px; height:26px; image-rendering:pixelated; object-fit:contain; }
+.tex-ic .tex-q { font-size:13px; color:var(--faint); line-height:1; }
+#f-texture-note:empty { display:none; }
+#f-texture-note.warn { color:var(--accent); }
+#f-texture-note.err { color:var(--danger); }
+.in:disabled, .in[disabled] { opacity:.55; cursor:not-allowed; }
+/* A disabled number input still has clickable ▲/▼ next to it (the stepper module decorates every
+   input[type=number] and does not look at `disabled`), and those arrows would happily write into a
+   field the UI just said is off-limits. Hide them instead of teaching the module a new rule. */
+.num-wrap:has(> .in:disabled) .num-steps { display:none; }
+.num-wrap:has(> .in:disabled) > .in { padding-right:var(--sp-3); }
+
+.tp-modal { max-width:660px; }
+.tp-bar { display:flex; align-items:center; gap:var(--sp-2); }
+.tp-bar > .in { flex:1 1 auto; min-width:0; }
+.tp-bar .btn { flex:0 0 auto; }
+/* «текстуры выключены» banner — the whole point is that it CANNOT be missed, so it is a filled
+   danger card, not a grey hint */
+.tp-off {
+  font-size:12.5px; color:var(--text); line-height:1.45;
+  border:1px solid var(--danger); border-radius:var(--r-sm);
+  padding:var(--sp-2) var(--sp-3); background:rgba(255,81,105,.08);
+}
+.tp-drop {
+  display:flex; flex-direction:column; gap:var(--sp-1); align-items:center; text-align:center;
+  padding:var(--sp-3); border:1px dashed var(--border-2); border-radius:var(--r-sm);
+  color:var(--muted); font-size:12.5px; background:var(--panel);
+}
+.tp-drop.over { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
+.tp-drop .faint { font-size:11px; }
+.tp-scroll { max-height:44vh; }
+.tp-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(96px, 1fr)); gap:var(--sp-2); }
+.tp-cell {
+  position:relative;
+  display:flex; flex-direction:column; align-items:center; gap:var(--sp-1);
+  min-height:104px; padding:var(--sp-2) var(--sp-1); text-align:center; cursor:pointer;
+  background:var(--panel-2); color:var(--text);
+  border:1px solid var(--border); border-radius:var(--r-xs);
+}
+.tp-cell:hover { border-color:var(--accent); background:var(--accent-soft); }
+.tp-cell:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.tp-cell.active { border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); }
+/* the checkerboard makes a transparent PNG readable in BOTH themes (a white icon on a white card
+   is invisible, and half of these textures are white-ish) */
+.tp-thumb {
+  width:100%; height:56px; display:flex; align-items:center; justify-content:center;
+  border-radius:var(--r-xs); overflow:hidden;
+  background-color:#2a2a2e;
+  background-image:linear-gradient(45deg, #1c1c1f 25%, transparent 25%, transparent 75%, #1c1c1f 75%),
+                   linear-gradient(45deg, #1c1c1f 25%, transparent 25%, transparent 75%, #1c1c1f 75%);
+  background-size:12px 12px; background-position:0 0, 6px 6px;
+}
+.tp-thumb img { max-width:100%; max-height:100%; image-rendering:pixelated; object-fit:contain; }
+.tp-thumb .tp-noimg { font-size:16px; color:var(--faint); }
+.tp-name { font-size:11px; font-family:var(--mono); color:var(--text); word-break:break-all; line-height:1.15; }
+.tp-size { font-size:10px; color:var(--faint); font-family:var(--mono); }
+.tp-badge {
+  position:absolute; top:3px; right:3px;
+  font-size:9px; line-height:1; padding:2px 4px; border-radius:999px;
+  background:var(--accent); color:#000;
+}
+/* «убрать из отправки» on a queued upload — the way back out of an overfull bundle */
+.tp-drop-btn {
+  position:absolute; top:2px; left:2px;
+  width:18px; height:18px; padding:0; line-height:1;
+  display:flex; align-items:center; justify-content:center;
+  font-size:13px; border-radius:var(--r-xs); cursor:pointer;
+  background:var(--elev); color:var(--muted); border:1px solid var(--border-2);
+}
+.tp-drop-btn:hover { color:var(--danger); border-color:var(--danger); }
+.tp-foot { display:flex; align-items:center; justify-content:space-between; gap:var(--sp-3); }
+.tp-foot .faint { font-size:11.5px; }
+
+/* ============ background editor (menu-settings) ============ */
+.bg-block { display:flex; flex-direction:column; gap:var(--stack-gap); }
+.bg-note { font-size:11.5px; color:var(--faint); margin:0; line-height:1.45; }
+/* the live geometry warnings are always-present nodes whose TEXT comes and goes — an empty one must
+   not keep eating a flex gap */
+.bg-note:empty { display:none; }
+.bg-note.warn { color:var(--accent); }
+.bg-note.err { color:var(--danger); }
+.bg-row { display:flex; align-items:center; gap:var(--sp-2); flex-wrap:wrap; }
+.bg-row > .in { flex:1 1 140px; min-width:0; }
+.bg-nums { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:var(--sp-2); }
+.bg-ovs { display:flex; flex-direction:column; gap:var(--sp-2); }
+.bg-ov {
+  background:var(--panel-2); border:1px solid var(--border); border-radius:var(--r-sm);
+  padding:var(--sp-2); display:flex; flex-direction:column; gap:var(--sp-2);
+}
+.bg-ov-head { display:flex; align-items:center; gap:var(--sp-2); }
+.bg-ov-head .ck-name { flex:1 1 auto; min-width:0; font-size:12px; color:var(--muted); }
+
+/* ---- schematic overlay over the slot grid ---- */
+/* Deliberately NOT a WYSIWYG preview: the picture is drawn by a bitmap font in the window title and
+   only the client knows the exact result. This shows WHERE it lands relative to the slots. */
+.bg-schema { position:absolute; inset:0; pointer-events:none; z-index:3; }
+.bg-schema .bgs-win {
+  position:absolute; border:1px dashed var(--border-2); border-radius:2px;
+}
+.bg-schema .bgs-box { position:absolute; overflow:hidden; }
+.bg-schema .bgs-box img {
+  width:100%; height:100%; image-rendering:pixelated; object-fit:fill; opacity:.85;
+}
+.bg-schema .bgs-box.main { outline:1px solid var(--accent); outline-offset:-1px; }
+.bg-schema .bgs-box.ov { outline:1px dashed var(--green); outline-offset:-1px; }
+.bg-schema .bgs-box.empty { background:var(--accent-soft); }
+.bg-schema .bgs-box.ov.empty { background:rgba(53,210,154,.14); }
+.bg-schema .bgs-lbl {
+  position:absolute; top:1px; left:2px;
+  font-size:9px; font-family:var(--mono); line-height:1.1;
+  color:#000; background:var(--accent); border-radius:2px; padding:0 3px;
+}
+.bg-schema .bgs-box.ov .bgs-lbl { background:var(--green); }
+.bg-schema .bgs-cap {
+  position:absolute; font-size:10.5px; color:var(--faint); white-space:nowrap;
+}
 
 /* ============ toasts ============ */
 .toasts {

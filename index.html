@@ -4,11 +4,6 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AlexMenus — редактор меню</title>
-  <!-- Пиксель-арт 16x16. SVG первым: он собран из прямоугольников с shape-rendering: crispEdges,
-       поэтому резкий на любом DPI. PNG 32x32 (ровно x2, без промежуточных оттенков) — запасной. -->
-  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
-  <link rel="icon" type="image/png" sizes="32x32" href="assets/logo-32.png" />
-  <link rel="apple-touch-icon" href="assets/logo-128.png" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -35,12 +30,20 @@
   <!-- ===================== TOP BAR ===================== -->
   <header class="topbar" id="topbar" hidden>
     <div class="brand">
-      <img class="mark" src="assets/logo.svg" alt="" aria-hidden="true" />
+      <span class="dot" aria-hidden="true"></span>
       <span class="wordmark">AlexMenus</span>
       <span class="sep" aria-hidden="true">/</span>
       <span class="cur-menu" id="cur-menu-id">—</span>
     </div>
     <div class="top-actions">
+      <!-- Bundle-size meter. Menus AND every newly uploaded PNG travel in ONE JSON body, and the paste
+           worker hard-caps it at 2 MB, so the number has to be visible BEFORE the button is pressed —
+           discovering a 413 after an hour of work is the worst possible outcome. updateSizeMeter()
+           in app.js paints it and disables both buttons past the safe limit. -->
+      <div class="size-meter" id="size-meter" hidden>
+        <div class="size-bar" aria-hidden="true"><i id="size-fill"></i></div>
+        <span class="size-txt" id="size-txt">—</span>
+      </div>
       <button class="btn icon" id="theme-btn" type="button" title="Светлая / тёмная тема" aria-label="Переключить тему">◐</button>
       <button class="btn toggle" id="graph-toggle" type="button" aria-pressed="false">
         <span class="tog-box" aria-hidden="true"></span> Граф
@@ -248,6 +251,26 @@
               </div>
             </section>
 
+            <!-- background (custom GUI texture) ---------------------------------------- -->
+            <!-- Built entirely by renderMenuBackground() in app.js: it needs the menu's rows, the
+                 texture catalog the plugin put in the bundle, and the overlay list, none of which
+                 exist as static markup. The schematic preview lives over the slot grid (#bg-schema). -->
+            <section class="acc ms-wide" data-acc="ms-bg" data-open="false">
+              <button class="acc-head" type="button" id="acc-ms-bg-btn"
+                      aria-expanded="false" aria-controls="acc-ms-bg-body">
+                <span class="acc-chev" aria-hidden="true"></span>
+                <span class="acc-title">Фон окна (background)</span>
+                <span class="acc-sub">картинка · позиция · оверлеи</span>
+              </button>
+              <div class="acc-body" id="acc-ms-bg-body" role="region" aria-labelledby="acc-ms-bg-btn">
+                <div class="acc-inner">
+                  <div class="acc-fields">
+                    <div class="bg-block" id="ms-bg-block"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <!-- open-requirement ------------------------------------------------------ -->
             <section class="acc ms-wide req-section" data-acc="ms-openreq" data-open="false">
               <button class="acc-head" type="button" id="acc-ms-openreq-btn"
@@ -268,6 +291,11 @@
 
         <div class="grid-wrap" id="grid-wrap">
           <div class="slot-grid" id="slot-grid"></div>
+          <!-- Schematic overlay for `background:` — absolutely positioned over the grid by
+               renderBgSchema(), pointer-events:none so it never steals a slot click. It is a SCHEMA,
+               not a WYSIWYG preview: the game draws the picture with a bitmap font in the window
+               title, and only the server can say what that really looks like. -->
+          <div class="bg-schema" id="bg-schema" hidden aria-hidden="true"></div>
           <p class="grid-hint" id="grid-hint">Клик по ячейке — выбрать/создать элемент.</p>
         </div>
       </div><!-- /.center-scroll -->
@@ -424,6 +452,21 @@
                   <span class="lbl">custom-model-data (cmd)</span>
                   <input type="text" id="f-cmd" class="in" placeholder="напр. 101" />
                 </label>
+
+                <!-- Texture from the generated resource pack. `texture:` and `cmd:` are mutually
+                     exclusive on the plugin side (an explicit cmd WINS and the texture is dropped —
+                     it may have been written for someone else's pack), so #f-texture-note says so
+                     out loud instead of letting the icon silently not appear. -->
+                <div class="field" id="f-texture-field">
+                  <span class="lbl">Текстура из пака (texture)</span>
+                  <div class="mat-row">
+                    <span class="tex-ic" id="f-texture-ic" aria-hidden="true"></span>
+                    <input type="text" id="f-texture" class="in" placeholder="coin — файл textures/items/coin.png" />
+                    <button class="btn small" id="f-texture-pick" type="button" title="Выбрать текстуру из пака">Выбрать…</button>
+                    <button class="btn small danger-ghost" id="f-texture-clear" type="button" title="Убрать текстуру">×</button>
+                  </div>
+                  <p class="faint" id="f-texture-note"></p>
+                </div>
               </div>
             </div>
           </div>
@@ -514,7 +557,7 @@
   <section class="empty-state" id="empty-state" hidden>
     <div class="es-card">
       <div class="brand big">
-        <img class="mark" src="assets/logo.svg" alt="" aria-hidden="true" />
+        <span class="dot" aria-hidden="true"></span>
         <span class="wordmark">AlexMenus</span>
       </div>
       <h1>Редактор меню</h1>
@@ -591,6 +634,44 @@
       <div class="mp-note faint" id="mp-note" hidden></div>
       <div class="mp-scroll" id="mp-scroll">
         <div class="mp-grid" id="mp-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== TEXTURE PICKER / UPLOADER MODAL =====================
+       One modal for both pipelines, but never for both at once: it is always opened FOR a kind
+       ('item' = textures/items, 'gui' = textures/gui), because an icon and a window background are
+       resampled completely differently and mixing them in one list is how a 176x166 background ends
+       up stretched over a slot. Uploaded files are normalised through a canvas BEFORE they enter the
+       bundle (64px icons / 256px backgrounds) — the plugin would resample them to exactly that anyway,
+       so nothing is lost and the payload drops by an order of magnitude. -->
+  <div class="overlay" id="texture-modal" hidden>
+    <div class="modal tp-modal" role="dialog" aria-modal="true" aria-labelledby="tp-title">
+      <div class="mp-head">
+        <h2 id="tp-title">Текстуры пака</h2>
+        <button class="btn icon" id="tp-close" type="button" aria-label="Закрыть">×</button>
+      </div>
+
+      <!-- shown when the server reports textures.enabled: false -->
+      <div class="tp-off" id="tp-off" hidden></div>
+
+      <div class="tp-bar">
+        <input type="text" id="tp-search" class="in" placeholder="Поиск по имени…" autocomplete="off" />
+        <button class="btn small" id="tp-browse" type="button">Загрузить PNG…</button>
+        <button class="btn small danger-ghost" id="tp-none" type="button">Без текстуры</button>
+      </div>
+      <input type="file" id="tp-file" accept="image/png,image/*" multiple hidden />
+
+      <div class="tp-drop" id="tp-drop">
+        <span id="tp-drop-txt">Перетащи сюда PNG — или нажми «Загрузить PNG…»</span>
+        <span class="faint" id="tp-drop-note"></span>
+      </div>
+
+      <div class="mp-scroll tp-scroll" id="tp-scroll">
+        <div class="tp-grid" id="tp-grid"></div>
+      </div>
+      <div class="tp-foot">
+        <span class="faint" id="tp-note"></span>
       </div>
     </div>
   </div>

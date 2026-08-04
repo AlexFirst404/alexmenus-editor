@@ -32,6 +32,32 @@
   const itemDefCache = new Map(); // item name -> Promise<json|null>   (1.21.4 item-definitions)
   const BUNDLE_VERSION = 1;
 
+  // ---- textures (custom resource pack) ------------------------------------------------------
+  // The plugin puts its texture catalog into the SAME bundle as the menus, and new PNGs ride back
+  // in the same body as base64. That means one shared 2 MB budget for everything — see the meter.
+  //
+  //   MAX_ITEM_PX / MAX_GUI_PX — the browser resamples every upload down to these BEFORE it enters
+  //   the bundle. Not a UI nicety: PackGenerator packs icons as flat 2D item textures and GuiFont
+  //   clamps every background glyph to 256 px per side and resamples it there, so a 1024x1024 source
+  //   would be thrown away by the server anyway — after costing 2.4 MB of the 2 MB budget.
+  const MAX_ITEM_PX = 64;
+  const MAX_GUI_PX = 256;
+  // Per-file cap on the plugin side (TextureStore.MAX_PNG_BYTES). The bundle carries the real value
+  // in `pngLimit`; this is only the fallback for an older plugin build.
+  const PNG_LIMIT_DEFAULT = 1024 * 1024;
+  // Worker's MAX_BYTES. Shown as the denominator so the number matches what the admin will hit.
+  const BUNDLE_LIMIT = 2 * 1024 * 1024;
+  // Where the editor actually refuses to send. Lower than BUNDLE_LIMIT on purpose: the live «Применить»
+  // channel stores the body in a SQLite-backed Durable Object whose "key + value" cap is 2 MB, so a
+  // body AT the limit dies inside the worker's try/catch and comes back as a confusing 500 instead of
+  // a 413. Stopping ~150 KB early keeps the failure honest.
+  const BUNDLE_SAFE = 1900 * 1024;
+  const SIZE_WARN_AT = 0.7;         // meter turns accent-coloured past 70%
+  // Chest window geometry in GAME pixels — the coordinate system `background:` is written in.
+  // Mirrors MenuBackground: 176 wide, rows*18+31 tall, first slot at (7,17), title baseline 13
+  // (so `ascent: 13` puts the top of the picture exactly on the top edge of the window).
+  const WIN_W = 176, SLOT_PITCH = 18, SLOT_X0 = 7, SLOT_Y0 = 17, TITLE_BASELINE = 13;
+
   // Paste-service Worker base URL. The default is the shared public paste worker on a NEUTRAL subdomain
   // (no account handle), so the editor is zero-config. An explicit `?w=` in the link overrides it; forks
   // that blank DEFAULT_WORKER fall back to a saved value or a one-time prompt.
@@ -136,7 +162,17 @@
     raw: false,            // raw-YAML mode active?
     graph: false,          // navigation-graph view active?
     reqEdit: false,        // full-screen requirement editor active?
-    reqEditCtx: null       // { title, subtitle, value, onChange } for the full-screen requirement editor
+    reqEditCtx: null,      // { title, subtitle, value, onChange } for the full-screen requirement editor
+    // texture catalog from the bundle + everything queued for upload. `enabled` mirrors the server's
+    // textures.enabled: false there means `texture:`/`background:` are IGNORED by the plugin, and the
+    // editor must say so instead of letting the admin decorate a menu into the void.
+    tex: {
+      enabled: false,
+      known: false,        // did the bundle carry the flag at all? (an older plugin build did not)
+      pngLimit: PNG_LIMIT_DEFAULT,
+      item: [],            // [{ name, kind, w, h, bytes, b64, pending }]
+      gui: []
+    }
   };
 
   // transient drag-select bookkeeping
@@ -269,6 +305,7 @@
       const bundle = await res.json();
       const list = (bundle && Array.isArray(bundle.menus)) ? bundle.menus : [];
       state.menus = list.map((m) => ({ id: String(m.id), obj: safeLoad(m.yaml, m.id) }));
+      readTextureCatalog(bundle);
 
       if (!state.menus.length) return failLoad('В бандле нет меню. Создай меню кнопкой «＋».', true);
 
@@ -276,6 +313,9 @@
       resetSelection();
       show('editor');
       renderAll();
+      if (state.tex.known && !state.tex.enabled) {
+        toast('Текстуры на сервере выключены (textures.enabled: false) — texture: и background: будут проигнорированы', 'err');
+      }
     } catch (e) {
       failLoad('Не удалось связаться с сервером (сеть/CORS). ' + (e && e.message ? e.message : ''));
     }
@@ -310,28 +350,28 @@
     if (!commitRaw()) return; // flush raw editor; abort if its YAML is invalid
     if (!state.menus.length) { toast('Нет меню для сохранения', 'err'); return; }
 
+    const body = buildBundleBody();
+    if (!guardBundleSize(body)) return;
+
     const btn = $('save-btn');
     btn.disabled = true;
     try {
-      const menus = state.menus.map((m) => ({
-        id: m.id,
-        yaml: jsyaml.dump(m.obj, { lineWidth: -1, noRefs: true, indent: 2 })
-      }));
-      const bundle = JSON.stringify({ v: BUNDLE_VERSION, menus });
-
       const res = await fetch(state.workerBase + '/post', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: bundle
+        body: body.json
       });
       if (!res.ok) throw new Error('POST /post -> ' + res.status);
       const out = await res.json();
       if (!out || !out.key) throw new Error('в ответе нет key');
+      // The paste now carries the pictures; the NEXT save must not pay for them a second time.
+      markUploadsSent(body.uploads);
       openSaveModal(out.key);
     } catch (e) {
       toast('Не удалось сохранить: ' + (e && e.message ? e.message : 'сеть'), 'err');
     } finally {
       btn.disabled = false;
+      updateSizeMeter();
     }
   }
 
@@ -345,26 +385,58 @@
       toast('Эта ссылка без live-сессии — используй «Сохранить и получить код»', 'err');
       return;
     }
+    const body = buildBundleBody();
+    if (!guardBundleSize(body)) return;
+
     const btn = $('apply-btn');
     btn.disabled = true;
     try {
-      const menus = state.menus.map((m) => ({
-        id: m.id,
-        yaml: jsyaml.dump(m.obj, { lineWidth: -1, noRefs: true, indent: 2 })
-      }));
       const res = await fetch(state.workerBase + '/apply/' + encodeURIComponent(state.applyToken), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ v: BUNDLE_VERSION, menus })
+        body: body.json
       });
       if (!res.ok) throw new Error('POST /apply -> ' + res.status);
-      toast('Отправлено — сервер подхватит изменения (обычно за секунды, изредка до минуты)');
+      markUploadsSent(body.uploads);
+      toast('Отправлено — сервер подхватит изменения (обычно за секунды, изредка до минуты)'
+            + (body.uploads.length ? ' · картинок: ' + body.uploads.length : ''));
     } catch (e) {
       toast('Не удалось применить: ' + (e && e.message ? e.message : 'сеть')
             + '. Используй «Сохранить и получить код».', 'err');
     } finally {
       btn.disabled = false;
+      updateSizeMeter();
     }
+  }
+
+  // ---------- one place that turns the editor state into the wire body ----------
+  // Both channels send exactly the same JSON, so they must build it in exactly one place: a divergence
+  // here means «Применить» ships the textures and «Сохранить» silently does not.
+  function buildBundleBody() {
+    const menus = state.menus.map((m) => ({
+      id: m.id,
+      yaml: jsyaml.dump(m.obj, { lineWidth: -1, noRefs: true, indent: 2 })
+    }));
+    const uploads = pendingUploads();
+    const bundle = { v: BUNDLE_VERSION, menus };
+    if (uploads.length) {
+      bundle.assets = uploads.map((e) => ({ name: e.name, kind: e.kind, png: e.b64 }));
+    }
+    const json = JSON.stringify(bundle);
+    return { json, uploads, size: measureJson(json) };
+  }
+
+  // Refuse to POST a body the worker will reject anyway, and say exactly what to do about it.
+  function guardBundleSize(body) {
+    if (body.size <= BUNDLE_SAFE) return true;
+    const uploads = body.uploads.length;
+    toast('Бандл ' + fmtBytes(body.size) + ' — больше предела ' + fmtBytes(BUNDLE_LIMIT)
+          + (uploads
+              ? '. Открой «Выбрать…» у текстуры и убери часть новых картинок крестиком (их '
+                + uploads + '), либо примени их в два захода.'
+              : '. Меню слишком тяжёлые для paste-сервиса — раздели их.'), 'err');
+    updateSizeMeter();
+    return false;
   }
 
   // ================================================================== RENDER
@@ -376,6 +448,7 @@
     syncModes();
     const m = current();
     $('cur-menu-id').textContent = m ? m.id : '—';
+    updateSizeMeter();
   }
 
   // ---------- sidebar (menu list) ----------
@@ -636,6 +709,9 @@
       (block) => { if (block == null) delete m.obj['open-requirement']; else m.obj['open-requirement'] = block; },
       { title: 'Условие открытия меню (open-requirement)', scope: 'menu' });
 
+    // background: custom GUI texture (+ the schematic over the slot grid)
+    renderMenuBackground();
+
     // collapsed-state summaries + steppers for everything this pass (re)built
     setAccSub('ms-openitem', oiMat.value.trim() ? oiMat.value.trim().toUpperCase() : 'не задан');
     setAccSub('ms-openreq', m.obj['open-requirement'] != null ? 'задано' : 'нет');
@@ -655,6 +731,7 @@
       grid.style.display = 'none';
       hint.textContent = 'Тип «' + type + '» редактируется через «Сырой YAML» (кнопка сверху).';
       $('sel-count').hidden = true;
+      renderBgSchema();   // no grid -> the schema has nothing to anchor to; this hides it
       return;
     }
     grid.style.display = 'grid';
@@ -666,6 +743,9 @@
     for (let s = 0; s < count; s++) grid.append(buildCell(items[String(s)], s));
     scheduleIconFallback(grid);
     updateSelCounter();
+    // The cells were just rebuilt, so the schema's anchor (cell 0) moved — redraw it against the
+    // fresh geometry rather than leaving it hanging over the old layout.
+    renderBgSchema();
   }
 
   function buildCell(item, slot) {
@@ -831,10 +911,14 @@
     $('slot-rest').hidden = !real;
     if (!real) return;
 
-    // cmd (custom-model-data) — bulk
+    // cmd (custom-model-data) — bulk. Also repaints the texture note: an explicit cmd WINS over
+    // `texture:` on the plugin side, so typing one here silently switches the texture off.
     const fCmd = $('f-cmd');
     fCmd.value = disp.cmd != null ? String(disp.cmd) : '';
-    fCmd.oninput = () => applyBulk((it) => setOrDel(it, 'cmd', fCmd.value), false);
+    fCmd.oninput = () => { applyBulk((it) => setOrDel(it, 'cmd', fCmd.value), false); paintTextureNote(disp); };
+
+    // texture (pack icon) — bulk
+    renderTextureField(disp);
 
     // name — bulk
     const fName = $('f-name');
@@ -1909,9 +1993,38 @@
     fields.append(overrideTextField('Имя (name)', f, 'name', '', it.name, 'убрать имя', commit));
     fields.append(overrideLoreField(f, it, commit));
     fields.append(textField('custom-model-data (cmd)', f.cmd, (v) => { setOrDel(f, 'cmd', v); commit(false); }));
+    // `texture:` works per FRAME too (MenuStore resolves icons for frames through the same path), which
+    // is how an animated icon changes picture without changing material. Same rule as on the item:
+    // an explicit cmd on this frame wins and the texture is dropped.
+    if (state.tex.enabled) fields.append(frameTextureField(f, commit));
 
     row.append(fields);
     return row;
+  }
+
+  // compact texture row for one animation frame: text + picker, empty = inherit the base item's icon
+  function frameTextureField(f, commit) {
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'in';
+    inp.placeholder = 'как у базового';
+    inp.value = f.texture != null ? String(f.texture) : '';
+    const ic = el('span', 'tex-ic');
+    setTexIcon(ic, texFind('item', inp.value));
+    const sync = () => {
+      setOrDel(f, 'texture', inp.value.trim());
+      setTexIcon(ic, texFind('item', inp.value));
+      commit(false);
+    };
+    inp.oninput = sync;
+    const pick = el('button', 'btn small', 'Выбрать…');
+    pick.type = 'button';
+    pick.onclick = () => openTexturePicker({
+      kind: 'item', current: inp.value,
+      onPick: (name) => { inp.value = name; sync(); }
+    });
+    const row = el('div', 'mat-row');
+    row.append(ic, inp, pick);
+    return labelWrap('Текстура из пака (texture)', row);
   }
 
   // text field + an «убрать» checkbox: unchecked & empty -> key absent (inherit); unchecked & typed
@@ -3630,6 +3743,11 @@
     if (state.raw) dumpRaw();
     if (state.graph) renderGraph();
     if (state.reqEdit) renderReqEdit();
+    // LAST, and here rather than in renderAll(): the background schema is positioned from the live
+    // cell geometry, and until the mode classes above are off the grid is still display:none — every
+    // offset reads 0 and the schema silently gives up. renderAll() calls syncModes() at the end, so
+    // this is the first moment the grid is measurable again.
+    renderBgSchema();
   }
 
   function dumpRaw() {
@@ -4132,6 +4250,926 @@
     ta.remove();
   }
 
+  // ================================================================== TEXTURES
+  /* Custom resource-pack textures: the catalog the plugin ships in the bundle, the uploader that puts
+   * new PNGs back into it, and the bundle-size meter that keeps the whole thing under the worker's cap.
+   *
+   * WHY THE CATALOG TRAVELS IN THE BUNDLE: the paste worker only knows "store a body / return a body".
+   * A second channel for binaries would need worker changes, a second round-trip and its own TTL, and
+   * the numbers say it is not needed yet — 50 icons at 32x32 plus 10 backgrounds at 256x256 is ~780 KB
+   * of the 2 MB budget once the browser has normalised them.
+   *
+   * WHY THE BROWSER RESAMPLES: the server would do it anyway (icons are flat 2D item textures, glyph
+   * backgrounds are clamped to 256 px per side and nearest-neighbour resampled), so shrinking here
+   * loses nothing and is the difference between a 4 KB upload and a 2.4 MB one.
+   *
+   * NAME RULES ARE COPIED FROM THE PLUGIN ON PURPOSE (texSanitize == TextureStore.sanitize): the editor
+   * writes `texture: coin` into YAML, and the file lands under whatever name the plugin's sanitiser
+   * produced. If the two disagreed by a single character, the menu would reference a file that does
+   * not exist — and the only symptom would be a plain PAPER in a slot.
+   */
+
+  // file name -> id. Same rules as TextureStore.sanitize: lower-case, only [a-z0-9_-], everything else
+  // DELETED (not replaced) — that deletion is also what kills path traversal, since dots and slashes
+  // cannot survive it.
+  function texSanitize(name) {
+    let base = String(name == null ? '' : name).trim();
+    const slash = Math.max(base.lastIndexOf('/'), base.lastIndexOf('\\'));
+    if (slash >= 0) base = base.slice(slash + 1);
+    if (base.toLowerCase().endsWith('.png')) base = base.slice(0, -4);
+    return base.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  }
+
+  const texList = (kind) => (kind === 'gui' ? state.tex.gui : state.tex.item);
+  function texFind(kind, name) {
+    const id = texSanitize(name);
+    if (!id) return null;
+    return texList(kind).find((e) => e.name === id) || null;
+  }
+  // data URL for an <img>, or null when the plugin sent this entry without a preview (too big / the
+  // catalog's preview budget ran out). Name-only entries are still fully usable — just not visible.
+  function texDataUrl(entry) {
+    return entry && entry.b64 ? 'data:image/png;base64,' + entry.b64 : null;
+  }
+  function pendingUploads() {
+    return texList('item').concat(texList('gui')).filter((e) => e.pending);
+  }
+  // called after a successful POST: the pictures are on the wire, so they stop counting as "new"
+  function markUploadsSent(uploads) {
+    uploads.forEach((e) => { e.pending = false; });
+    renderTexGrid();
+  }
+
+  // Read the catalog the plugin put next to the menus. Tolerates every older shape: a missing block
+  // (pre-textures plugin), bare strings instead of objects, entries without previews.
+  function readTextureCatalog(bundle) {
+    const t = state.tex;
+    const has = !!bundle && typeof bundle === 'object';
+    t.known = has && bundle.texturesEnabled != null;
+    t.enabled = has && bundle.texturesEnabled === true;
+    const limit = has ? parseInt(bundle.pngLimit, 10) : NaN;
+    t.pngLimit = (!isNaN(limit) && limit > 0) ? limit : PNG_LIMIT_DEFAULT;
+    t.item = catalogFrom(has ? bundle.textures : null, 'item');
+    t.gui = catalogFrom(has ? bundle.guiTextures : null, 'gui');
+  }
+
+  function catalogFrom(raw, kind) {
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    raw.forEach((e) => {
+      const name = texSanitize(typeof e === 'string' ? e : (e && e.name));
+      if (!name || out.some((x) => x.name === name)) return;
+      const o = (e && typeof e === 'object') ? e : {};
+      out.push({
+        name,
+        kind,
+        w: parseInt(o.w, 10) || 0,
+        h: parseInt(o.h, 10) || 0,
+        bytes: parseInt(o.bytes, 10) || 0,
+        b64: typeof o.png === 'string' && o.png ? o.png : null,
+        pending: false
+      });
+    });
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }
+
+  // ---------- upload: canvas normalisation ----------
+  // Down-scales to the pipeline's real ceiling and re-encodes as PNG. imageSmoothingEnabled=false is
+  // not a style choice: the plugin resamples backgrounds nearest-neighbour, and a browser-smoothed
+  // source would arrive blurred and then be resampled AGAIN.
+  function normalizeImage(file, kind) {
+    const max = kind === 'gui' ? MAX_GUI_PX : MAX_ITEM_PX;
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) { reject(new Error('не удалось прочитать размеры картинки')); return; }
+        const k = Math.min(1, max / w, max / h);
+        const tw = Math.max(1, Math.round(w * k)), th = Math.max(1, Math.round(h * k));
+        const cv = document.createElement('canvas');
+        cv.width = tw; cv.height = th;
+        const ctx = cv.getContext('2d');
+        if (!ctx) { reject(new Error('canvas недоступен')); return; }
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, tw, th);
+        ctx.drawImage(img, 0, 0, tw, th);
+        cv.toBlob((blob) => {
+          if (!blob) { reject(new Error('не удалось перекодировать в PNG')); return; }
+          blob.arrayBuffer()
+            .then((buf) => resolve({ bytes: new Uint8Array(buf), w: tw, h: th, scaled: k < 1 }))
+            .catch(reject);
+        }, 'image/png');
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('не картинка или файл повреждён')); };
+      img.src = url;
+    });
+  }
+
+  const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  function isPngBytes(b) {
+    if (!b || b.length < PNG_MAGIC.length) return false;
+    for (let i = 0; i < PNG_MAGIC.length; i++) if (b[i] !== PNG_MAGIC[i]) return false;
+    return true;
+  }
+  // btoa() on a 256 KB string via apply() blows the argument limit, hence the chunking
+  function bytesToB64(bytes) {
+    let s = '';
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }
+    return btoa(s);
+  }
+
+  // Take one dropped/chosen file all the way to a catalog entry. Keeps the ORIGINAL bytes when they
+  // are already a small-enough PNG and weigh less than the re-encode: canvas always writes RGBA8, so
+  // a palettised 256x256 background can be 4 KB as authored and 20 KB after a pointless round trip.
+  async function ingestFile(file, kind) {
+    const norm = await normalizeImage(file, kind);
+    let bytes = norm.bytes;
+    if (!norm.scaled) {
+      try {
+        const raw = new Uint8Array(await file.arrayBuffer());
+        if (isPngBytes(raw) && raw.length && raw.length <= bytes.length) bytes = raw;
+      } catch (e) { /* keep the canvas copy */ }
+    }
+    if (bytes.length > state.tex.pngLimit) {
+      throw new Error('после сжатия всё ещё ' + fmtBytes(bytes.length)
+                      + ' — предел плагина ' + fmtBytes(state.tex.pngLimit));
+    }
+    return { bytes, w: norm.w, h: norm.h, scaled: norm.scaled };
+  }
+
+  async function addTextureFiles(files, kind) {
+    if (!files || !files.length) return;
+    if (!state.tex.enabled) { toast('Текстуры на сервере выключены — загружать некуда', 'err'); return; }
+    let added = 0;
+    for (const file of files) {
+      let name = texSanitize(file.name);
+      if (!name) {
+        name = texSanitize(await modalPrompt('Имя текстуры', {
+          label: 'Из имени файла «' + file.name + '» не осталось ни одного допустимого символа. '
+               + 'Задай имя латиницей (a-z, 0-9, _ и -).',
+          placeholder: 'coin'
+        }));
+        if (!name) continue;
+      }
+      const existing = texFind(kind, name);
+      if (existing) {
+        const ok = await modalConfirm('Заменить текстуру?',
+          'Текстура «' + name + '» уже есть' + (existing.pending ? ' (ещё не отправлена)' : ' на сервере')
+          + '. Заменить её этим файлом?');
+        if (!ok) continue;
+      }
+      let img;
+      try {
+        img = await ingestFile(file, kind);
+      } catch (e) {
+        toast('«' + file.name + '»: ' + (e && e.message ? e.message : 'не удалось обработать'), 'err');
+        continue;
+      }
+      const entry = {
+        name, kind, w: img.w, h: img.h, bytes: img.bytes.length,
+        b64: bytesToB64(img.bytes), pending: true
+      };
+      const list = texList(kind);
+      const at = list.findIndex((e) => e.name === name);
+      if (at >= 0) list[at] = entry; else list.push(entry);
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      added++;
+      if (img.scaled) {
+        toast('«' + name + '» ужата до ' + img.w + '×' + img.h
+              + ' — пак всё равно не примет больше', 'ok');
+      }
+    }
+    if (added) {
+      renderTexGrid();
+      updateSizeMeter();
+      renderProps();
+      renderMenuSettings();
+      renderBgSchema();
+      toast(added + ' ' + plural(added, 'картинка добавлена', 'картинки добавлены', 'картинок добавлено')
+            + ' — уедут на сервер по «Применить»', 'ok');
+    }
+  }
+
+  // ---------- picker modal ----------
+  let tpCtx = null;          // { kind, current, allowClear, onPick }
+  let tpSearchTimer = null;
+
+  // The picker is ALWAYS opened for one pipeline. `allowClear` shows the «Без текстуры» button.
+  function openTexturePicker(opts) {
+    tpCtx = {
+      kind: opts.kind === 'gui' ? 'gui' : 'item',
+      current: texSanitize(opts.current),
+      allowClear: opts.allowClear !== false,
+      onPick: opts.onPick
+    };
+    const gui = tpCtx.kind === 'gui';
+    $('tp-title').textContent = gui ? 'Фон окна — текстуры GUI' : 'Иконка предмета — текстуры пака';
+    $('tp-drop-note').textContent = gui
+      ? 'PNG из plugins/AlexMenus/textures/gui/ · большие ужимаются до ' + MAX_GUI_PX + '×' + MAX_GUI_PX
+        + ' (потолок шрифтового атласа)'
+      : 'PNG из plugins/AlexMenus/textures/items/ · большие ужимаются до ' + MAX_ITEM_PX + '×' + MAX_ITEM_PX;
+    const off = $('tp-off');
+    off.hidden = state.tex.enabled;
+    off.textContent = 'На сервере textures.enabled: false — плагин не собирает пак и игнорирует ключи '
+                    + 'texture: и background:. Загрузка отключена; включи текстуры в config.yml и выполни /am reload.';
+    $('tp-browse').disabled = !state.tex.enabled;
+    $('tp-none').hidden = !tpCtx.allowClear;
+    $('tp-search').value = '';
+    $('texture-modal').hidden = false;
+    renderTexGrid();
+    $('tp-search').focus();
+  }
+
+  function closeTexturePicker() {
+    $('texture-modal').hidden = true;
+    tpCtx = null;
+  }
+
+  function renderTexGrid() {
+    if (!tpCtx) return;
+    const grid = $('tp-grid');
+    if (!grid) return;
+    clear(grid);
+    const q = ($('tp-search').value || '').trim().toLowerCase();
+    const all = texList(tpCtx.kind);
+    const shown = q ? all.filter((e) => e.name.indexOf(q) !== -1) : all;
+    shown.forEach((e) => grid.append(buildTexCell(e)));
+
+    const note = $('tp-note');
+    if (!all.length) {
+      note.textContent = state.tex.enabled
+        ? 'В паке пока нет ни одной картинки — перетащи PNG сюда.'
+        : 'Каталог пуст: текстуры выключены на сервере.';
+    } else {
+      const pend = all.filter((e) => e.pending).length;
+      note.textContent = shown.length + ' из ' + all.length
+        + (pend ? ' · новых (ещё не на сервере): ' + pend : '');
+    }
+  }
+
+  function buildTexCell(entry) {
+    const cell = el('button', 'tp-cell' + (tpCtx && entry.name === tpCtx.current ? ' active' : ''));
+    cell.type = 'button';
+    const thumb = el('div', 'tp-thumb');
+    const url = texDataUrl(entry);
+    if (url) {
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = entry.name;
+      thumb.append(img);
+    } else {
+      // A catalog entry without a preview is normal: the plugin only embeds pictures up to a budget.
+      thumb.append(el('span', 'tp-noimg', '🖼'));
+    }
+    cell.append(thumb);
+    cell.append(el('span', 'tp-name', entry.name));
+    const size = entry.w && entry.h ? entry.w + '×' + entry.h : '';
+    cell.append(el('span', 'tp-size', size + (entry.bytes ? (size ? ' · ' : '') + fmtBytes(entry.bytes) : '')));
+    if (entry.pending) {
+      cell.append(el('span', 'tp-badge', 'новая'));
+      // The size meter can block sending; without a way to take a queued picture back OUT, the only
+      // escape from an overfull bundle would be reloading the page and losing every unsaved edit.
+      const drop = el('button', 'tp-drop-btn', '×');
+      drop.type = 'button';
+      drop.title = 'Убрать из отправки (файл на сервере не тронут)';
+      drop.onclick = (e) => { e.stopPropagation(); removePending(entry); };
+      cell.append(drop);
+    }
+    cell.title = entry.name + (url ? '' : ' — превью не приехало (крупный файл), но текстура рабочая');
+    cell.onclick = () => {
+      const cb = tpCtx && tpCtx.onPick;
+      closeTexturePicker();
+      if (cb) cb(entry.name);
+    };
+    return cell;
+  }
+
+  // Take a queued upload back out of the bundle. Only ever called for `pending` entries — anything
+  // already on the server would need a delete channel the plugin deliberately does not have.
+  function removePending(entry) {
+    const list = texList(entry.kind);
+    const at = list.indexOf(entry);
+    if (at < 0) return;
+    list.splice(at, 1);
+    const used = texUsage(entry.name, entry.kind);
+    renderTexGrid();
+    updateSizeMeter();
+    renderProps();
+    renderMenuSettings();
+    toast('«' + entry.name + '» убрана из отправки'
+          + (used ? ' — но на неё всё ещё ссылается меню (' + used + ')' : ''),
+          used ? 'err' : 'ok');
+  }
+
+  // How many places still reference this texture name (so removing it can say so out loud).
+  function texUsage(name, kind) {
+    let n = 0;
+    state.menus.forEach((m) => {
+      const obj = m.obj || {};
+      if (kind === 'gui') {
+        const bg = bgOf(obj);
+        if (!bg) return;
+        if (texSanitize(bg.image) === name) n++;
+        (Array.isArray(bg.overlays) ? bg.overlays : []).forEach((ov) => {
+          if (texSanitize(ov.image) === name) n++;
+        });
+        return;
+      }
+      const items = (obj.items && typeof obj.items === 'object') ? obj.items : {};
+      Object.keys(items).forEach((k) => {
+        const it = items[k];
+        if (!it || typeof it !== 'object') return;
+        if (texSanitize(it.texture) === name) n++;
+        const frames = it.animation && Array.isArray(it.animation.frames) ? it.animation.frames : [];
+        frames.forEach((f) => { if (f && texSanitize(f.texture) === name) n++; });
+      });
+    });
+    return n;
+  }
+
+  // ---------- bundle-size meter ----------
+  // Both numbers matter: the worker compares body.length (UTF-16 code units) against its 2 MB cap,
+  // while the Durable Object behind «Применить» stores real bytes. Cyrillic YAML makes those two
+  // differ by up to 2x, so the meter shows whichever is closer to blowing up.
+  function measureJson(json) {
+    const chars = json.length;
+    let bytes = chars;
+    try { bytes = new TextEncoder().encode(json).length; } catch (e) { /* ancient browser */ }
+    return Math.max(chars, bytes);
+  }
+
+  function fmtBytes(n) {
+    if (!isFinite(n)) return '—';
+    if (n < 1024) return n + ' Б';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10 * 1024 ? 1 : 0).replace('.', ',') + ' КБ';
+    const mb = n / (1024 * 1024);
+    // «2 МБ», not «2,00 МБ» — the denominator of the meter must read like the limit it is
+    return (Math.abs(mb - Math.round(mb)) < 0.005 ? String(Math.round(mb))
+                                                  : mb.toFixed(2).replace('.', ',')) + ' МБ';
+  }
+
+  let sizeTimer = null;
+  // Measuring means dumping every menu to YAML, so it is debounced off keystrokes. Both send paths
+  // measure again synchronously before posting — the meter is a warning light, not the gate.
+  function scheduleSizeMeter() {
+    clearTimeout(sizeTimer);
+    sizeTimer = setTimeout(updateSizeMeter, 700);
+  }
+
+  function updateSizeMeter() {
+    const meter = $('size-meter');
+    if (!meter) return;
+    if (!state.menus.length) { meter.hidden = true; return; }
+    let size;
+    try {
+      size = measureJson(buildBundleBody().json);
+    } catch (e) {
+      meter.hidden = true;   // a menu object that won't serialise: raw mode will report it properly
+      return;
+    }
+    meter.hidden = false;
+    const frac = Math.min(1, size / BUNDLE_LIMIT);
+    const over = size > BUNDLE_SAFE;
+    $('size-fill').style.width = (frac * 100).toFixed(1) + '%';
+    $('size-txt').textContent = fmtBytes(size) + ' / ' + fmtBytes(BUNDLE_LIMIT);
+    meter.classList.toggle('warn', !over && frac >= SIZE_WARN_AT);
+    meter.classList.toggle('over', over);
+    const pend = pendingUploads();
+    meter.title = 'Размер бандла: меню + ' + pend.length + ' '
+      + plural(pend.length, 'новая картинка', 'новые картинки', 'новых картинок')
+      + '. Предел paste-сервиса — ' + fmtBytes(BUNDLE_LIMIT)
+      + (over ? '. Сейчас отправка заблокирована.' : '');
+    // The apply button has its own reason to be disabled (a link minted without a live session) —
+    // never re-enable it here, only add the size veto on top.
+    $('save-btn').disabled = over;
+    $('apply-btn').disabled = over || !state.applyToken;
+  }
+
+  // ---------- slot `texture:` field ----------
+  function renderTextureField(disp) {
+    const field = $('f-texture-field');
+    if (!field) return;
+    const inp = $('f-texture');
+    const enabled = state.tex.enabled;
+    const raw = disp.texture != null ? String(disp.texture) : '';
+    inp.value = raw;
+    inp.disabled = !enabled;
+    $('f-texture-pick').disabled = !enabled;
+    $('f-texture-clear').disabled = !enabled || !raw;
+    setTexIcon($('f-texture-ic'), texFind('item', raw));
+
+    inp.oninput = () => {
+      applyBulk((it) => setOrDel(it, 'texture', inp.value.trim()), false);
+      paintTextureNote(disp);
+      setTexIcon($('f-texture-ic'), texFind('item', inp.value));
+      $('f-texture-clear').disabled = !inp.value.trim();
+    };
+    $('f-texture-pick').onclick = () => openTexturePicker({
+      kind: 'item',
+      current: inp.value,
+      onPick: (name) => { inp.value = name; inp.oninput(); }
+    });
+    $('f-texture-clear').onclick = () => { inp.value = ''; inp.oninput(); };
+    paintTextureNote(disp);
+  }
+
+  // Everything that can make `texture:` silently do nothing, said out loud.
+  function paintTextureNote(disp) {
+    const note = $('f-texture-note');
+    if (!note) return;
+    const raw = ($('f-texture').value || '').trim();
+    const cmd = ($('f-cmd').value || '').trim();
+    note.className = 'faint';
+    if (!state.tex.enabled) {
+      note.className = 'faint err';
+      note.textContent = state.tex.known
+        ? 'Текстуры выключены на сервере (textures.enabled: false) — ключ texture: будет проигнорирован.'
+        : 'Плагин не сообщил о поддержке текстур — обнови плагин или используй cmd:.';
+      return;
+    }
+    if (!raw) { note.textContent = ''; return; }
+    const id = texSanitize(raw);
+    if (!id) {
+      note.className = 'faint err';
+      note.textContent = 'Недопустимое имя: разрешены только a-z, 0-9, _ и -. Плагин это имя отбросит.';
+      return;
+    }
+    if (id !== raw) {
+      note.className = 'faint warn';
+      note.textContent = 'Плагин приведёт имя к «' + id + '» — файл должен называться textures/items/'
+                       + id + '.png. Лучше вписать «' + id + '» прямо здесь.';
+      return;
+    }
+    if (cmd) {
+      note.className = 'faint warn';
+      note.textContent = 'Заданы и cmd:, и texture: — выигрывает cmd:, текстура НЕ подключится '
+                       + '(явный cmd мог быть написан под чужой пак). Очисти cmd, чтобы включить текстуру.';
+      return;
+    }
+    if (!texFind('item', id)) {
+      note.className = 'faint warn';
+      note.textContent = 'В паке нет textures/items/' + id + '.png — загрузи файл через «Выбрать…».';
+      return;
+    }
+    note.textContent = 'Плагин выдаст предмету custom-model-data «am_' + id + '» из собранного пака.';
+  }
+
+  function setTexIcon(host, entry) {
+    if (!host) return;
+    clear(host);
+    const url = texDataUrl(entry);
+    if (url) {
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = '';
+      host.append(img);
+    } else {
+      host.append(el('span', 'tex-q', entry ? '🖼' : '—'));
+    }
+  }
+
+  // ================================================================== BACKGROUND (menu `background:`)
+  /* The editor writes the human form of the vertical axis: `y:` = offset from the TOP of the window,
+   * which parseBackground turns into `ascent: 13 - y`. Both keys are accepted by the plugin and
+   * `ascent:` wins when both are present, so writing `y:` and deleting any inherited `ascent:` is the
+   * only way to keep the two from fighting.
+   */
+  const bgOf = (obj) => (obj && obj.background && typeof obj.background === 'object') ? obj.background : null;
+  const chestHeight = (rows) => rows * SLOT_PITCH + 31;
+  // `ascent:` -> "offset from the top". Kept as one named helper so the schema and the fields cannot
+  // drift apart on the sign.
+  const topFromAscent = (a) => TITLE_BASELINE - a;
+  const ascentFromTop = (y) => TITLE_BASELINE - y;
+
+  function readTop(spec) {
+    if (spec && spec.ascent != null && String(spec.ascent).trim() !== '') {
+      const a = parseInt(spec.ascent, 10);
+      if (!isNaN(a)) return topFromAscent(a);
+    }
+    const y = parseInt(spec && spec.y, 10);
+    return isNaN(y) ? 0 : y;
+  }
+  // Always writes `y:` and drops `ascent:`: keeping both means the editor's number is silently ignored.
+  function writeTop(spec, y) {
+    delete spec.ascent;
+    if (y) spec.y = y; else delete spec.y;
+  }
+
+  // Effective on-screen size, mirroring GuiFont.resolve(): height 0 = natural, width 0 = from the
+  // natural proportions at that height, both clamped to 1..256. Returns [0,0] when the natural size
+  // is unknown (a catalog entry that arrived without a preview) and nothing was typed.
+  function bgSize(entry, w, h) {
+    const clamp = (v) => Math.max(1, Math.min(MAX_GUI_PX, v));
+    const nw = entry && entry.w > 0 ? entry.w : 0;
+    const nh = entry && entry.h > 0 ? entry.h : 0;
+    let H = w > 0 || h > 0 || nh > 0 ? (h > 0 ? h : nh) : 0;
+    if (!H) return [0, 0];
+    H = clamp(H);
+    let W = h > 0 || w > 0 || nw > 0 ? (w > 0 ? w : Math.round(nw * (H / nh))) : 0;
+    if (!W) return [0, H];
+    return [clamp(W), H];
+  }
+
+  function renderMenuBackground() {
+    const host = $('ms-bg-block');
+    const m = current();
+    if (!host || !m) return;
+    clear(host);
+    const type = m.obj.type || 'chest';
+    const bg = bgOf(m.obj);
+
+    if (!state.tex.enabled) {
+      host.append(noteEl('Текстуры на сервере выключены (textures.enabled: false) — блок background: '
+        + 'будет проигнорирован при загрузке меню. Включи textures.enabled в config.yml и выполни /am reload.', 'err'));
+    }
+    if (type !== 'chest') {
+      host.append(noteEl('Фон работает только на type: chest — картинка живёт в ЗАГОЛОВКЕ окна сундука, '
+        + 'а у меню в инвентаре игрока заголовка нет.', 'warn'));
+      setAccSub('ms-bg', 'только для chest');
+      renderBgSchema();
+      return;
+    }
+
+    // main image row (+ enable/disable of the whole block)
+    const row = el('div', 'bg-row');
+    const ic = el('span', 'tex-ic');
+    setTexIcon(ic, bg ? texFind('gui', bg.image) : null);
+    const img = document.createElement('input');
+    img.type = 'text'; img.className = 'in';
+    img.placeholder = 'shop_bg — файл textures/gui/shop_bg.png';
+    img.value = bg && bg.image != null ? String(bg.image) : '';
+    img.disabled = !state.tex.enabled;
+    const commitImage = () => {
+      const spec = ensureBg(m.obj);
+      setOrDel(spec, 'image', img.value.trim());
+      dropEmptyBg(m.obj);
+      setTexIcon(ic, texFind('gui', img.value));
+      off.disabled = !bgOf(m.obj);   // the whole block may have just appeared or vanished
+      afterBgEdit();
+    };
+    img.oninput = commitImage;
+    const pick = el('button', 'btn small', 'Выбрать…');
+    pick.type = 'button';
+    pick.disabled = !state.tex.enabled;
+    pick.onclick = () => openTexturePicker({
+      kind: 'gui', current: img.value,
+      onPick: (name) => { img.value = name; commitImage(); renderMenuBackground(); }
+    });
+    const off = el('button', 'btn small danger-ghost', 'Убрать фон');
+    off.type = 'button';
+    off.disabled = !bg;
+    off.onclick = () => { delete m.obj.background; afterBgEdit(); renderMenuBackground(); };
+    row.append(ic, img, pick, off);
+    host.append(fieldWrap('Картинка фона (background.image)', row));
+
+    // Live geometry/availability warning. It has to repaint on every keystroke, not on the next full
+    // render: an ascent the client will clamp looks exactly like "the picture ignores my Y", and
+    // finding that out only after switching menus is finding it out in the game.
+    const mainNote = noteEl('', 'warn');
+    host.append(mainNote);
+    const paintMain = () => paintGeomNote(mainNote, bgOf(m.obj), true);
+
+    // position + size
+    const rows = rowsOf(m.obj);
+    const entry = bg ? texFind('gui', bg.image) : null;
+    const nums = el('div', 'bg-nums');
+    const edit = (fn) => { fn(); paintMain(); afterBgEdit(); };
+    nums.append(bgNum('X (слева, px)', bg && bg.x, (v) => edit(() => writeNum(ensureBg(m.obj), 'x', v)),
+      { min: -256, max: 512, ph: '0' }));
+    nums.append(bgNum('Y (сверху, px)', bg ? readTop(bg) || null : null,
+      (v) => edit(() => writeTop(ensureBg(m.obj), v || 0)), { min: -256, max: 512, ph: '0' }));
+    nums.append(bgNum('Ширина', bg && bg.width, (v) => edit(() => writeNum(ensureBg(m.obj), 'width', v)),
+      { min: 1, max: MAX_GUI_PX, ph: String(bgSize(entry, 0, 0)[0] || WIN_W) }));
+    nums.append(bgNum('Высота', bg && bg.height, (v) => edit(() => writeNum(ensureBg(m.obj), 'height', v)),
+      { min: 1, max: MAX_GUI_PX, ph: String(bgSize(entry, 0, 0)[1] || chestHeight(rows)) }));
+    host.append(fieldWrap('Позиция и размер (в игровых пикселях)', nums));
+    paintMain();
+    img.addEventListener('input', paintMain);
+    host.append(noteEl('Окно сундука на ' + rows + ' ' + plural(rows, 'ряд', 'ряда', 'рядов') + ' — '
+      + WIN_W + '×' + chestHeight(rows) + ' px, первый слот в (7, 17). Пустые ширина/высота = '
+      + 'натуральный размер PNG (сторона зажимается в 256 — это потолок шрифтового атласа клиента).'));
+
+    // overlays
+    const ovs = Array.isArray(bg && bg.overlays) ? bg.overlays : [];
+    const ovHost = el('div', 'bg-ovs');
+    ovs.forEach((_, i) => ovHost.append(buildOverlayRow(m.obj, i)));
+    const addOv = el('button', 'btn small', '+ Оверлей');
+    addOv.type = 'button';
+    addOv.disabled = !state.tex.enabled;
+    addOv.onclick = () => {
+      const spec = ensureBg(m.obj);
+      if (!Array.isArray(spec.overlays)) spec.overlays = [];
+      spec.overlays.push({ image: '', x: 0, y: 0 });
+      afterBgEdit();
+      renderMenuBackground();
+    };
+    ovHost.append(addOv);
+    host.append(fieldWrap('Оверлеи — рисуются ПОВЕРХ фона, по порядку', ovHost));
+    host.append(noteEl('Схема поверх сетки слотов — ориентир, а не WYSIWYG: картинка рисуется '
+      + 'bitmap-шрифтом в заголовке окна, и точная позиция подгоняется в игре (/am reload — и смотри).'));
+
+    setAccSub('ms-bg', bgSummary(m.obj));
+    numChrome(host);
+    renderBgSchema();
+  }
+
+  function buildOverlayRow(obj, idx) {
+    const spec = ensureBg(obj);
+    const ov = spec.overlays[idx];
+    const row = el('div', 'bg-ov');
+    const head = el('div', 'bg-ov-head');
+    const ic = el('span', 'tex-ic');
+    setTexIcon(ic, texFind('gui', ov.image));
+    head.append(ic, el('span', 'ck-name', 'Оверлей ' + (idx + 1)));
+
+    const up = el('button', 'btn icon', '↑'); up.type = 'button'; up.title = 'Выше';
+    up.disabled = idx === 0;
+    up.onclick = () => { spec.overlays.splice(idx - 1, 0, spec.overlays.splice(idx, 1)[0]); afterBgEdit(); renderMenuBackground(); };
+    const down = el('button', 'btn icon', '↓'); down.type = 'button'; down.title = 'Ниже';
+    down.disabled = idx === spec.overlays.length - 1;
+    down.onclick = () => { spec.overlays.splice(idx + 1, 0, spec.overlays.splice(idx, 1)[0]); afterBgEdit(); renderMenuBackground(); };
+    const del = el('button', 'btn icon', '×'); del.type = 'button'; del.title = 'Удалить оверлей';
+    del.onclick = () => {
+      spec.overlays.splice(idx, 1);
+      if (!spec.overlays.length) delete spec.overlays;
+      dropEmptyBg(obj);
+      afterBgEdit();
+      renderMenuBackground();
+    };
+    head.append(up, down, del);
+    row.append(head);
+
+    const imgRow = el('div', 'bg-row');
+    const img = document.createElement('input');
+    img.type = 'text'; img.className = 'in';
+    img.placeholder = 'banner — файл textures/gui/banner.png (обязательно)';
+    img.value = ov.image != null ? String(ov.image) : '';
+    img.disabled = !state.tex.enabled;
+    const commit = () => { setOrDel(ov, 'image', img.value.trim()); setTexIcon(ic, texFind('gui', img.value)); afterBgEdit(); };
+    img.oninput = commit;
+    const pick = el('button', 'btn small', 'Выбрать…');
+    pick.type = 'button';
+    pick.disabled = !state.tex.enabled;
+    pick.onclick = () => openTexturePicker({
+      kind: 'gui', current: img.value,
+      onPick: (name) => { img.value = name; commit(); renderMenuBackground(); }
+    });
+    imgRow.append(img, pick);
+    row.append(imgRow);
+
+    const entry = texFind('gui', ov.image);
+    const note = noteEl('', 'warn');
+    const paint = () => paintGeomNote(note, ov, false);
+    img.addEventListener('input', paint);
+    const edit = (fn) => { fn(); paint(); afterBgEdit(); };
+    const nums = el('div', 'bg-nums');
+    nums.append(bgNum('X', ov.x, (v) => edit(() => writeNum(ov, 'x', v)), { min: -256, max: 512, ph: '0' }));
+    nums.append(bgNum('Y', readTop(ov) || null, (v) => edit(() => writeTop(ov, v || 0)),
+      { min: -256, max: 512, ph: '0' }));
+    nums.append(bgNum('Ширина', ov.width, (v) => edit(() => writeNum(ov, 'width', v)),
+      { min: 1, max: MAX_GUI_PX, ph: String(bgSize(entry, 0, 0)[0] || 16) }));
+    nums.append(bgNum('Высота', ov.height, (v) => edit(() => writeNum(ov, 'height', v)),
+      { min: 1, max: MAX_GUI_PX, ph: String(bgSize(entry, 0, 0)[1] || 16) }));
+    row.append(nums, note);
+    paint();
+    return row;
+  }
+
+  /**
+   * Everything that can make one picture silently not appear, in priority order. Shared by the main
+   * background and by every overlay so the two can never drift apart.
+   */
+  function paintGeomNote(node, spec, isMain) {
+    if (!node) return;
+    if (!spec) { node.textContent = ''; return; }
+    const raw = String(spec.image == null ? '' : spec.image).trim();
+    if (!raw) {
+      node.textContent = isMain
+        ? ''   // a background with overlays but no main picture is a legitimate setup
+        : 'Без image запись будет пропущена плагином.';
+      return;
+    }
+    const id = texSanitize(raw);
+    if (!id) {
+      node.textContent = 'Недопустимое имя «' + raw + '»: разрешены только a-z, 0-9, _ и -.';
+      return;
+    }
+    if (id !== raw) {
+      node.textContent = 'Плагин приведёт имя к «' + id + '» — файл должен называться textures/gui/'
+                       + id + '.png.';
+      return;
+    }
+    const entry = texFind('gui', id);
+    if (state.tex.enabled && !entry) {
+      node.textContent = 'В паке нет textures/gui/' + id
+                       + '.png — плагин предупредит и нарисует окно без этой картинки.';
+      return;
+    }
+    // ascent > height is forbidden by vanilla and would kill the WHOLE font, so GuiFont clamps it.
+    // From the outside the clamp looks exactly like «картинка не слушается Y».
+    const size = bgSize(entry, parseInt(spec.width, 10) || 0, parseInt(spec.height, 10) || 0);
+    const asc = ascentFromTop(readTop(spec));
+    if (size[1] > 0 && asc > size[1]) {
+      node.textContent = 'Y = ' + readTop(spec) + ' даёт ascent ' + asc + ' при высоте ' + size[1]
+        + ' — ванилла запрещает ascent больше высоты, плагин его зажмёт (картинка не поднимется выше). '
+        + 'Дорисуй картинке прозрачные поля сверху или увеличь высоту.';
+      return;
+    }
+    node.textContent = '';
+  }
+
+  // optional integer field: empty box = key absent (the plugin's own default), never a written 0
+  function bgNum(label, val, onset, opts) {
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.className = 'in';
+    inp.min = String(opts.min); inp.max = String(opts.max); inp.step = '1';
+    if (opts.ph != null) inp.placeholder = opts.ph;
+    inp.value = (val != null && String(val).trim() !== '') ? String(val) : '';
+    inp.disabled = !state.tex.enabled;
+    inp.oninput = () => {
+      const raw = inp.value.trim();
+      if (raw === '') { onset(null); return; }
+      const n = parseInt(raw, 10);
+      onset(isNaN(n) ? null : Math.max(opts.min, Math.min(opts.max, n)));
+    };
+    return labelWrap(label, inp);
+  }
+  function writeNum(obj, key, v) {
+    if (v == null || v === 0) delete obj[key]; else obj[key] = v;
+  }
+  function noteEl(text, cls) {
+    return el('p', 'bg-note' + (cls ? ' ' + cls : ''), text);
+  }
+  function ensureBg(obj) {
+    if (!obj.background || typeof obj.background !== 'object') obj.background = {};
+    return obj.background;
+  }
+  // `background:` with neither image nor overlays is a warning on the plugin side — drop the key
+  // instead of shipping YAML that shouts on every reload.
+  function dropEmptyBg(obj) {
+    const bg = bgOf(obj);
+    if (!bg) return;
+    const hasImage = String(bg.image || '').trim() !== '';
+    const hasOv = Array.isArray(bg.overlays) && bg.overlays.length > 0;
+    if (!hasImage && !hasOv) delete obj.background;
+  }
+  function bgSummary(obj) {
+    const bg = bgOf(obj);
+    if (!bg) return 'нет';
+    const bits = [];
+    if (bg.image) bits.push(String(bg.image));
+    const n = Array.isArray(bg.overlays) ? bg.overlays.length : 0;
+    if (n) bits.push(n + ' ' + plural(n, 'оверлей', 'оверлея', 'оверлеев'));
+    return bits.length ? bits.join(' · ') : 'пусто';
+  }
+  function afterBgEdit() {
+    renderBgSchema();
+    scheduleSizeMeter();
+    const m = current();
+    if (m) setAccSub('ms-bg', bgSummary(m.obj));
+  }
+
+  // ---------- schematic overlay over the slot grid ----------
+  // Game pixels -> screen pixels is read off the LIVE grid (cell pitch), so it keeps working after
+  // the --cell token changes or the browser zooms.
+  function renderBgSchema() {
+    const layer = $('bg-schema');
+    const wrap = $('grid-wrap');
+    if (!layer || !wrap) return;
+    clear(layer);
+    layer.hidden = true;
+    wrap.style.paddingTop = '';        // always start from the stylesheet value (see below)
+    const m = current();
+    if (!m || state.raw || state.graph || state.reqEdit) return;
+    if ((m.obj.type || 'chest') !== 'chest') return;
+    const bg = bgOf(m.obj);
+    if (!bg) return;
+
+    const cells = $('slot-grid').querySelectorAll('.cell');
+    if (cells.length < 2) return;
+    const scale = cells[1].offsetLeft - cells[0].offsetLeft;   // one slot pitch on screen
+    if (!(scale > 0)) return;
+    const px = scale / SLOT_PITCH;                              // screen px per game px
+
+    // The window starts 17 game px ABOVE the first slot — at this zoom that is more room than the
+    // grid's own padding, and a scroll container cannot be scrolled into negative space, so without
+    // extra padding the top strip of the background would be permanently cut off. Reserve it here
+    // (reset above first, so the computation never feeds on its own previous result).
+    const need = SLOT_Y0 * px + 6;
+    if (need > cells[0].offsetTop) {
+      const base = parseFloat(getComputedStyle(wrap).paddingTop) || 0;
+      wrap.style.paddingTop = (base + (need - cells[0].offsetTop)) + 'px';
+    }
+
+    const ox = cells[0].offsetLeft - SLOT_X0 * px;              // screen x of game x=0
+    const oy = cells[0].offsetTop - SLOT_Y0 * px;
+    const rows = rowsOf(m.obj);
+
+    layer.hidden = false;
+    const win = el('div', 'bgs-win');
+    place(win, ox, oy, WIN_W * px, chestHeight(rows) * px);
+    layer.append(win);
+
+    const boxes = [];
+    if (String(bg.image || '').trim()) boxes.push({ spec: bg, main: true, label: String(bg.image) });
+    (Array.isArray(bg.overlays) ? bg.overlays : []).forEach((ov, i) => {
+      if (String(ov.image || '').trim()) boxes.push({ spec: ov, main: false, label: (i + 1) + ': ' + ov.image });
+    });
+
+    boxes.forEach((b) => {
+      const entry = texFind('gui', b.spec.image);
+      const size = bgSize(entry, parseInt(b.spec.width, 10) || 0, parseInt(b.spec.height, 10) || 0);
+      if (!size[0] || !size[1]) return;   // unknown natural size and nothing typed: nothing to draw
+      const gx = parseInt(b.spec.x, 10) || 0;
+      const gy = readTop(b.spec);
+      const box = el('div', 'bgs-box ' + (b.main ? 'main' : 'ov'));
+      const url = texDataUrl(entry);
+      if (url) {
+        const img = document.createElement('img');
+        img.src = url; img.alt = '';
+        box.append(img);
+      } else {
+        box.classList.add('empty');
+      }
+      box.append(el('span', 'bgs-lbl', b.label));
+      place(box, ox + gx * px, oy + gy * px, size[0] * px, size[1] * px);
+      layer.append(box);
+    });
+
+    const cap = el('div', 'bgs-cap', state.tex.enabled
+      ? 'Схема · точная позиция подгоняется в игре'
+      : 'Схема · текстуры на сервере выключены, в игре этого не будет');
+    cap.style.left = ox + 'px';
+    cap.style.top = (oy + chestHeight(rows) * px + 4) + 'px';
+    layer.append(cap);
+  }
+
+  function place(node, left, top, w, h) {
+    node.style.left = Math.round(left) + 'px';
+    node.style.top = Math.round(top) + 'px';
+    node.style.width = Math.max(1, Math.round(w)) + 'px';
+    node.style.height = Math.max(1, Math.round(h)) + 'px';
+  }
+
+  // ---------- static wiring for the picker (called once from wireStaticUi) ----------
+  function wireTextureUi() {
+    $('tp-close').onclick = closeTexturePicker;
+    $('tp-browse').onclick = () => $('tp-file').click();
+    $('tp-none').onclick = () => {
+      const cb = tpCtx && tpCtx.onPick;
+      closeTexturePicker();
+      if (cb) cb('');
+    };
+    $('tp-search').addEventListener('input', () => {
+      clearTimeout(tpSearchTimer);
+      tpSearchTimer = setTimeout(renderTexGrid, 110);
+    });
+    const file = $('tp-file');
+    file.addEventListener('change', () => {
+      const kind = tpCtx ? tpCtx.kind : 'item';
+      const files = [...file.files];
+      file.value = '';                        // so re-picking the SAME file fires `change` again
+      addTextureFiles(files, kind);
+    });
+
+    // drag & drop anywhere inside the modal; the dashed zone is only where the highlight shows
+    const modal = $('texture-modal');
+    const zone = $('tp-drop');
+    const hot = (on) => zone.classList.toggle('over', on);
+    ['dragenter', 'dragover'].forEach((ev) => modal.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = state.tex.enabled ? 'copy' : 'none';
+      hot(state.tex.enabled);
+    }));
+    ['dragleave', 'dragend'].forEach((ev) => modal.addEventListener(ev, (e) => {
+      if (e.target === modal || !modal.contains(e.relatedTarget)) hot(false);
+    }));
+    modal.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hot(false);
+      const files = e.dataTransfer ? [...e.dataTransfer.files] : [];
+      addTextureFiles(files, tpCtx ? tpCtx.kind : 'item');
+    });
+
+    // A file dropped ANYWHERE else would make the browser navigate to it — i.e. throw away every
+    // unsaved edit in this tab. Swallow those drops instead.
+    document.addEventListener('dragover', (e) => e.preventDefault());
+    document.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        toast('Открой «Выбрать…» у текстуры или фона и брось файл туда', 'err');
+      }
+    });
+  }
+
   // ================================================================== MATERIAL PICKER
   // Full 1.21.11 item/block list from PrismarineJS minecraft-data. Cached in-memory + localStorage.
   // On fetch failure the picker degrades to a note ("введите вручную") and the manual material text
@@ -4403,6 +5441,13 @@
     $('f-clicks').addEventListener('input', () => { if (targetSlots().length > 1) propagateClicks(); });
     $('f-clicks').addEventListener('change', () => { if (targetSlots().length > 1) propagateClicks(); });
 
+    wireTextureUi();
+
+    // Any edit anywhere changes the bundle's weight. One debounced document-level listener beats
+    // sprinkling scheduleSizeMeter() through forty field handlers (and forgetting it in three).
+    document.addEventListener('input', scheduleSizeMeter);
+    document.addEventListener('change', scheduleSizeMeter);
+
     // drag-select finishes anywhere on the page
     document.addEventListener('mouseup', onDocMouseUp);
 
@@ -4430,6 +5475,7 @@
         if (e.target === ov) {
           ov.hidden = true;
           if (ov.id === 'material-modal' && pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }
+          if (ov.id === 'texture-modal') tpCtx = null;   // hidden by the backdrop -> drop its callback
         }
       });
     });
@@ -4438,6 +5484,7 @@
       if (e.key === 'Escape') {
         document.querySelectorAll('.overlay').forEach((o) => (o.hidden = true));
         if (pickerObserver) { pickerObserver.disconnect(); pickerObserver = null; }  // don't leak the picker's observer
+        tpCtx = null;                                    // same for the texture picker's context
         hideContextMenu();
       }
     });
